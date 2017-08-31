@@ -101,7 +101,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_init(struct bmg160_t *bmg160)
 BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataX(BMG160_S16 *data_x)
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
-	unsigned char a_data_u8r[2] = { 0 };
+	unsigned char a_data_u8r[2] = {0, 0};
 	if (p_bmg160 == BMG160_NULL) {
 		return  E_BMG160_NULL_PTR;
 	} else {
@@ -148,7 +148,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataX(BMG160_S16 *data_x)
 BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataY(BMG160_S16 *data_y)
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
-	unsigned char a_data_u8r[2] = { 0 };
+	unsigned char a_data_u8r[2] = {0, 0};
 	if (p_bmg160 == BMG160_NULL) {
 		return  E_BMG160_NULL_PTR;
 	} else {
@@ -195,7 +195,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataY(BMG160_S16 *data_y)
 BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataZ(BMG160_S16 *data_z)
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
-	unsigned char a_data_u8r[2] = { 0 };
+	unsigned char a_data_u8r[2] = {0, 0};
 	if (p_bmg160 == BMG160_NULL) {
 		return  E_BMG160_NULL_PTR;
 	} else {
@@ -241,7 +241,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataZ(BMG160_S16 *data_z)
 BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataXYZ(struct bmg160_data_t *data)
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
-	unsigned char a_data_u8r[6] = { 0 };
+	unsigned char a_data_u8r[6] = {0, 0, 0, 0, 0, 0};
 	if (p_bmg160 == BMG160_NULL) {
 		return  E_BMG160_NULL_PTR;
 	} else {
@@ -301,7 +301,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataXYZ(struct bmg160_data_t *data)
 BMG160_RETURN_FUNCTION_TYPE bmg160_get_dataXYZI(struct bmg160_data_t *data)
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
-	unsigned char a_data_u8r[12] = { 0 };
+	unsigned char a_data_u8r[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 	if (p_bmg160 == BMG160_NULL) {
 		return  E_BMG160_NULL_PTR;
 	} else {
@@ -1294,7 +1294,7 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_set_shadow_dis(unsigned char shadow_dis)
  * Remarks:
  *
  *****************************************************************************/
-BMG160_RETURN_FUNCTION_TYPE bmg160_set_soft_reset(void)
+BMG160_RETURN_FUNCTION_TYPE bmg160_set_soft_reset()
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
 	unsigned char v_SoftReset_u8r  = C_BMG160_Zero_U8X;
@@ -5157,7 +5157,7 @@ unsigned char channel, unsigned char offset_wl)
  * Remarks:
  *
  *****************************************************************************/
-BMG160_RETURN_FUNCTION_TYPE bmg160_enable_fast_offset(void)
+BMG160_RETURN_FUNCTION_TYPE bmg160_enable_fast_offset()
 {
 	BMG160_RETURN_FUNCTION_TYPE comres  = C_BMG160_Zero_U8X;
 	unsigned char v_data_u8r  = C_BMG160_Zero_U8X;
@@ -7317,3 +7317,4 @@ BMG160_RETURN_FUNCTION_TYPE bmg160_set_sleepdur(unsigned char duration)
 	}
 	return comres;
 }
+

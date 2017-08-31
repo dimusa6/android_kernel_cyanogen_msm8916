@@ -40,7 +40,9 @@
 #include <string.h>
 #endif
 
+#if defined(CONFIG_SENSORS_COMMON) || defined(CONFIG_L9100_COMMON)
 #include <linux/regulator/consumer.h>
+#endif
 
 #include "bmm050.h"
 #include "bs_log.h"
@@ -61,7 +63,7 @@
 #define BMM_DEFAULT_REPETITION_Z BMM_VAL_NAME(REGULAR_REPZ)
 #define BMM_DEFAULT_ODR BMM_VAL_NAME(REGULAR_DR)
 /* generic */
-#define BMM_MAX_RETRY_I2C_XFER (3)
+#define BMM_MAX_RETRY_I2C_XFER (100)
 #define BMM_MAX_RETRY_WAKEUP (5)
 #define BMM_MAX_RETRY_WAIT_DRDY (100)
 
@@ -262,10 +264,7 @@ static int bmm_check_chip_id(struct i2c_client *client)
 	u8 read_count = 0;
 
 	while (read_count++ < CHECK_CHIP_ID_TIME_MAX) {
-		err = bmm_i2c_read(client, BMM_REG_NAME(CHIP_ID), &chip_id, 1);
-		if (err)
-			return err;
-
+		bmm_i2c_read(client, BMM_REG_NAME(CHIP_ID), &chip_id, 1);
 		if ((chip_id & 0xff) != SENSOR_CHIP_ID_BMM) {
 			mdelay(1);
 		} else {
@@ -297,7 +296,7 @@ static void bmm_dump_reg(struct i2c_client *client)
 
 	for (i = 0; i < BYTES_PER_LINE; i++) {
 		dbg_buf[i] = i;
-		snprintf(dbg_buf_str + i * 3,(sizeof(dbg_buf_str) - i * 3), "%02x%c",
+		sprintf(dbg_buf_str + i * 3, "%02x%c",
 				dbg_buf[i],
 				(((i + 1) % BYTES_PER_LINE == 0) ? '\n' : ' '));
 	}
@@ -305,7 +304,7 @@ static void bmm_dump_reg(struct i2c_client *client)
 
 	bmm_i2c_read(client, BMM_REG_NAME(CHIP_ID), dbg_buf, 64);
 	for (i = 0; i < 64; i++) {
-		snprintf(dbg_buf_str + i * 3,(sizeof(dbg_buf_str) - i * 3), "%02x%c",
+		sprintf(dbg_buf_str + i * 3, "%02x%c",
 				dbg_buf[i],
 				(((i + 1) % BYTES_PER_LINE == 0) ? '\n' : ' '));
 	}
@@ -320,6 +319,8 @@ static int bmm_wakeup(struct i2c_client *client)
 	const u8 value = 0x01;
 	u8 dummy;
 
+	//PINFO("waking up the chip...");
+
 	mdelay(BMM_I2C_WRITE_DELAY_TIME);
 	while (try_times) {
 		err = bmm_i2c_write(client,
@@ -333,6 +334,10 @@ static int bmm_wakeup(struct i2c_client *client)
 		try_times--;
 	}
 
+	//PINFO("wake up result: %s, tried times: %d",
+	//		(try_times > 0) ? "succeed" : "fail",
+	//		BMM_MAX_RETRY_WAKEUP - try_times + 1);
+
 	err = (try_times > 0) ? 0 : -1;
 
 	return err;
@@ -342,6 +347,33 @@ static int bmm_wakeup(struct i2c_client *client)
 static int bmm_i2c_read(struct i2c_client *client, u8 reg_addr,
 		u8 *data, u8 len)
 {
+#if !defined BMM_USE_BASIC_I2C_FUNC
+	s32 dummy;
+	if (NULL == client)
+		return -1;
+
+	while (0 != len--) {
+#ifdef BMM_SMBUS
+		dummy = i2c_smbus_read_byte_data(client, reg_addr);
+		if (dummy < 0) {
+			PERR("i2c bus read error");
+			return -1;
+		}
+		*data = (u8)(dummy & 0xff);
+#else
+		dummy = i2c_master_send(client, (char *)&reg_addr, 1);
+		if (dummy < 0)
+			return -1;
+
+		dummy = i2c_master_recv(client, (char *)data, 1);
+		if (dummy < 0)
+			return -1;
+#endif
+		reg_addr++;
+		data++;
+	}
+	return 0;
+#else
 	int retry;
 
 	struct i2c_msg msg[] = {
@@ -373,12 +405,41 @@ static int bmm_i2c_read(struct i2c_client *client, u8 reg_addr,
 	}
 
 	return 0;
+#endif
 }
 
 /*i2c write routine for */
 static int bmm_i2c_write(struct i2c_client *client, u8 reg_addr,
 		u8 *data, u8 len)
 {
+#if !defined BMM_USE_BASIC_I2C_FUNC
+	s32 dummy;
+
+#ifndef BMM_SMBUS
+	u8 buffer[2];
+#endif
+
+	if (NULL == client)
+		return -1;
+
+	while (0 != len--) {
+#ifdef BMM_SMBUS
+		dummy = i2c_smbus_write_byte_data(client, reg_addr, *data);
+#else
+		buffer[0] = reg_addr;
+		buffer[1] = *data;
+		dummy = i2c_master_send(client, (char *)buffer, 2);
+#endif
+		reg_addr++;
+		data++;
+		if (dummy < 0) {
+			PERR("error writing i2c bus");
+			return -1;
+		}
+
+	}
+	return 0;
+#else
 	u8 buffer[2];
 	int retry;
 	struct i2c_msg msg[] = {
@@ -410,6 +471,7 @@ static int bmm_i2c_write(struct i2c_client *client, u8 reg_addr,
 	}
 
 	return 0;
+#endif
 }
 
 static int bmm_i2c_read_wrapper(u8 dev_addr, u8 reg_addr, u8 *data, u8 len)
@@ -1155,7 +1217,7 @@ static int bmm_input_init(struct bmm_client_data *client_data)
 	input_set_abs_params(dev, ABS_Z, MAG_VALUE_MIN, MAG_VALUE_MAX, 0, 0);
 	input_set_drvdata(dev, client_data);
 
-	err = input_register_device(dev);
+	err = input_register_device(dev);		//sys/bus/i2c/drivers/bmm050
 	if (err < 0) {
 		input_free_device(dev);
 		return err;
@@ -1262,6 +1324,7 @@ static int bmm_parse_dt(struct device *dev,
 }
 #endif
 
+#if defined(CONFIG_SENSORS_COMMON) || defined(CONFIG_L9100_COMMON)
 static int sensor_set_power(struct i2c_client *client, int enable)
 {
 	int err = 0;
@@ -1292,6 +1355,7 @@ static int sensor_set_power(struct i2c_client *client, int enable)
 	}
 	return 0;
 }
+#endif
 
 static int bmm_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
@@ -1300,7 +1364,9 @@ static int bmm_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	int dummy;
 
 	/* power on */
+#if defined(CONFIG_SENSORS_COMMON) || defined(CONFIG_L9100_COMMON)
 	sensor_set_power(client,1);
+#endif
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 		PERR("i2c_check_functionality error!");
@@ -1324,11 +1390,16 @@ static int bmm_probe(struct i2c_client *client, const struct i2c_device_id *id)
 		goto exit_err_clean;
 	}
 
+	//PINFO("register dump after waking up");
 	bmm_dump_reg(client);
 	/* check chip id */
 	err = bmm_check_chip_id(client);
-	if (err) {
-		PERR("Bosch Sensortec Device not found, chip id mismatch");
+	if (!err) {
+		printk("Bosch Sensortec Device %s detected, i2c_addr: %#x\n",
+				SENSOR_NAME, client->addr);
+	} else {
+		PERR("Bosch Sensortec Device not found, chip id mismatch\n");
+		err = -1;
 		goto exit_err_clean;
 	}
 
@@ -1429,12 +1500,18 @@ static int bmm_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	client_data->rept_xy = BMM_DEFAULT_REPETITION_XY;
 	client_data->rept_z = BMM_DEFAULT_REPETITION_Z;
 
+
+#if 0
+	err = bmm_restore_hw_cfg(client);
+#else
+
 	err = bmm_set_op_mode(client_data, BMM_VAL_NAME(SUSPEND_MODE));
 	if (err) {
 		PERR("fail to init h/w of %s", SENSOR_NAME);
 		err = -EIO;
 		goto bst_pd_free_exit;
 	}
+#endif
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	client_data->early_suspend_handler.level =

@@ -549,6 +549,10 @@ BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ(
 		struct bmm050_mdata *mdata);
 BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_s32(
 		struct bmm050_mdata_s32 *mdata);
+#ifdef ENABLE_FLOAT
+BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_float(
+		struct bmm050_mdata_float *mdata);
+#endif
 BMM050_RETURN_FUNCTION_TYPE bmm050_read_register(
 		unsigned char addr, unsigned char *data, unsigned char len);
 BMM050_RETURN_FUNCTION_TYPE bmm050_write_register(
@@ -559,14 +563,26 @@ BMM050_S16 bmm050_compensate_X(
 		BMM050_S16 mdata_x, BMM050_U16 data_r);
 BMM050_S32 bmm050_compensate_X_s32(
 		BMM050_S16 mdata_x,  BMM050_U16 data_r);
+#ifdef ENABLE_FLOAT
+float bmm050_compensate_X_float(
+		BMM050_S16 mdata_x,  BMM050_U16 data_r);
+#endif
 BMM050_S16 bmm050_compensate_Y(
 		BMM050_S16 mdata_y, BMM050_U16 data_r);
 BMM050_S32 bmm050_compensate_Y_s32(
 		BMM050_S16 mdata_y,  BMM050_U16 data_r);
+#ifdef ENABLE_FLOAT
+float bmm050_compensate_Y_float(
+		BMM050_S16 mdata_y,  BMM050_U16 data_r);
+#endif
 BMM050_S16 bmm050_compensate_Z(
 		BMM050_S16 mdata_z,  BMM050_U16 data_r);
 BMM050_S32 bmm050_compensate_Z_s32(
 		BMM050_S16 mdata_z,  BMM050_U16 data_r);
+#ifdef ENABLE_FLOAT
+float bmm050_compensate_Z_float(
+		BMM050_S16 mdata_z,  BMM050_U16 data_r);
+#endif
 BMM050_RETURN_FUNCTION_TYPE bmm050_get_raw_xyz(
 struct bmm050_mdata *mdata);
 

@@ -20,7 +20,7 @@ static struct bmm050 *p_bmm050;
 BMM050_RETURN_FUNCTION_TYPE bmm050_init(struct bmm050 *bmm050)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
-	unsigned char a_data_u8r[2] = { 0 };
+	unsigned char a_data_u8r[2] = {0, 0};
 	p_bmm050 = bmm050;
 
 	p_bmm050->dev_addr = BMM050_I2C_ADDRESS;
@@ -188,7 +188,7 @@ BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ(struct bmm050_mdata *mdata)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
 
-	unsigned char a_data_u8r[8] = { 0 };
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 	struct {
 		BMM050_S16 raw_datax;
@@ -256,7 +256,7 @@ struct bmm050_remapped_mdata *mdata)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
 
-	unsigned char a_data_u8r[8] = { 0 };
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 	struct {
 		BMM050_S16 raw_datax;
@@ -324,7 +324,7 @@ struct bmm050_mdata_s32 *mdata)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
 
-	unsigned char a_data_u8r[8] = { 0 };
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 	struct {
 		BMM050_S16 raw_datax;
@@ -396,7 +396,7 @@ struct bmm050_remapped_mdata_s32 *mdata)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
 
-	unsigned char a_data_u8r[8] = { 0 };
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0 };
 
 	struct {
 		BMM050_S16 raw_datax;
@@ -459,6 +459,145 @@ struct bmm050_remapped_mdata_s32 *mdata)
 	return comres;
 }
 
+#ifdef ENABLE_FLOAT
+BMM050_RETURN_FUNCTION_TYPE bmm050_read_mdataXYZ_float(
+struct bmm050_mdata_float *mdata)
+{
+	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
+
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+	struct {
+		BMM050_S16 raw_datax;
+		BMM050_S16 raw_datay;
+		BMM050_S16 raw_dataz;
+		BMM050_U16 raw_datar;
+	} raw_dataxyz;
+
+	if (p_bmm050 == BMM050_NULL) {
+		return  E_BMM050_NULL_PTR;
+	} else {
+		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
+				BMM050_DATAX_LSB, a_data_u8r, 8);
+
+		/* Reading data for X axis */
+		a_data_u8r[0] = BMM050_GET_BITSLICE(a_data_u8r[0],
+				BMM050_DATAX_LSB_VALUEX);
+		raw_dataxyz.raw_datax = (BMM050_S16)((((BMM050_S16)
+						((signed char)a_data_u8r[1])) <<
+					SHIFT_LEFT_5_POSITION) | a_data_u8r[0]);
+
+		/* Reading data for Y axis */
+		a_data_u8r[2] = BMM050_GET_BITSLICE(a_data_u8r[2],
+				BMM050_DATAY_LSB_VALUEY);
+		raw_dataxyz.raw_datay = (BMM050_S16)((((BMM050_S16)
+						((signed char)a_data_u8r[3])) <<
+					SHIFT_LEFT_5_POSITION) | a_data_u8r[2]);
+
+		/* Reading data for Z axis */
+		a_data_u8r[4] = BMM050_GET_BITSLICE(a_data_u8r[4],
+				BMM050_DATAZ_LSB_VALUEZ);
+		raw_dataxyz.raw_dataz = (BMM050_S16)((((BMM050_S16)
+						((signed char)a_data_u8r[5])) <<
+					SHIFT_LEFT_7_POSITION) | a_data_u8r[4]);
+
+		/* Reading data for Resistance*/
+		a_data_u8r[6] = BMM050_GET_BITSLICE(a_data_u8r[6],
+				BMM050_R_LSB_VALUE);
+		raw_dataxyz.raw_datar = (BMM050_U16)((((BMM050_U16)
+						a_data_u8r[7]) <<
+					SHIFT_LEFT_6_POSITION) | a_data_u8r[6]);
+
+		/* Compensation for X axis */
+		mdata->datax = bmm050_compensate_X_float(raw_dataxyz.raw_datax,
+				raw_dataxyz.raw_datar);
+
+		/* Compensation for Y axis */
+		mdata->datay = bmm050_compensate_Y_float(raw_dataxyz.raw_datay,
+				raw_dataxyz.raw_datar);
+
+		/* Compensation for Z axis */
+		mdata->dataz = bmm050_compensate_Z_float(raw_dataxyz.raw_dataz,
+				raw_dataxyz.raw_datar);
+
+	    /* Output raw resistance value */
+	    mdata->resistance = raw_dataxyz.raw_datar;
+	}
+	return comres;
+}
+#endif
+
+/* In this function X and Y axis is remapped,
+ * this API is only applicable for BMX055*/
+#ifdef ENABLE_FLOAT
+BMM050_RETURN_FUNCTION_TYPE bmm050_read_bmx055_remapped_mdataXYZ_float(
+struct bmm050_remapped_mdata_float *mdata)
+{
+	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
+
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+	struct {
+		BMM050_S16 raw_datax;
+		BMM050_S16 raw_datay;
+		BMM050_S16 raw_dataz;
+		BMM050_U16 raw_datar;
+	} raw_dataxyz;
+
+	if (p_bmm050 == BMM050_NULL) {
+		return  E_BMM050_NULL_PTR;
+	} else {
+		comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
+			BMM050_BMX055_REMAPPED_DATAY_LSB, a_data_u8r, 8);
+
+		/* Reading data for Y axis */
+		a_data_u8r[0] = BMM050_GET_BITSLICE(a_data_u8r[0],
+				BMM050_BMX055_REMAPPED_DATAY_LSB_VALUEY);
+		raw_dataxyz.raw_datay = (BMM050_S16)((((BMM050_S16)
+						((signed char)a_data_u8r[1])) <<
+					SHIFT_LEFT_5_POSITION) | a_data_u8r[0]);
+
+		/* Reading data for X axis */
+		a_data_u8r[2] = BMM050_GET_BITSLICE(a_data_u8r[2],
+				BMM050_BMX055_REMAPPED_DATAX_LSB_VALUEX);
+		raw_dataxyz.raw_datax = (BMM050_S16)((((BMM050_S16)
+						((signed char)a_data_u8r[3])) <<
+					SHIFT_LEFT_5_POSITION) | a_data_u8r[2]);
+		raw_dataxyz.raw_datax = -raw_dataxyz.raw_datax;
+
+		/* Reading data for Z axis */
+		a_data_u8r[4] = BMM050_GET_BITSLICE(a_data_u8r[4],
+				BMM050_DATAZ_LSB_VALUEZ);
+		raw_dataxyz.raw_dataz = (BMM050_S16)((((BMM050_S16)
+						((signed char)a_data_u8r[5])) <<
+					SHIFT_LEFT_7_POSITION) | a_data_u8r[4]);
+
+		/* Reading data for Resistance*/
+		a_data_u8r[6] = BMM050_GET_BITSLICE(a_data_u8r[6],
+				BMM050_R_LSB_VALUE);
+		raw_dataxyz.raw_datar = (BMM050_U16)((((BMM050_U16)
+						a_data_u8r[7]) <<
+					SHIFT_LEFT_6_POSITION) | a_data_u8r[6]);
+
+		/* Compensation for X axis */
+		mdata->datax = bmm050_compensate_X_float(raw_dataxyz.raw_datax,
+				raw_dataxyz.raw_datar);
+
+		/* Compensation for Y axis */
+		mdata->datay = bmm050_compensate_Y_float(raw_dataxyz.raw_datay,
+				raw_dataxyz.raw_datar);
+
+		/* Compensation for Z axis */
+		mdata->dataz = bmm050_compensate_Z_float(raw_dataxyz.raw_dataz,
+				raw_dataxyz.raw_datar);
+
+	    /* Output raw resistance value */
+	    mdata->resistance = raw_dataxyz.raw_datar;
+	}
+	return comres;
+}
+#endif
+
 BMM050_RETURN_FUNCTION_TYPE bmm050_read_register(unsigned char addr,
 		unsigned char *data, unsigned char len)
 {
@@ -508,7 +647,7 @@ BMM050_RETURN_FUNCTION_TYPE bmm050_get_self_test_XYZ(
 unsigned char *self_testxyz)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
-	unsigned char a_data_u8r[5] = { 0 };
+	unsigned char a_data_u8r[5] = {0, 0, 0, 0, 0};
 	unsigned char v_result_u8r = 0x00;
 	if (p_bmm050 == BMM050_NULL) {
 		return  E_BMM050_NULL_PTR;
@@ -656,7 +795,7 @@ BMM050_S16 *diff_z)
 BMM050_RETURN_FUNCTION_TYPE bmm050_init_trim_registers(void)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
-	unsigned char a_data_u8r[2] = { 0 };
+	unsigned char a_data_u8r[2] = {0, 0};
 	comres = p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
 			BMM050_DIG_X1, (unsigned char *)&p_bmm050->dig_x1, 1);
 	comres += p_bmm050->BMM050_BUS_READ_FUNC(p_bmm050->dev_addr,
@@ -964,6 +1103,30 @@ BMM050_S32 bmm050_compensate_X_s32 (BMM050_S16 mdata_x, BMM050_U16 data_r)
 	return retval;
 }
 
+#ifdef ENABLE_FLOAT
+float bmm050_compensate_X_float (BMM050_S16 mdata_x, BMM050_U16 data_r)
+{
+	float inter_retval = BMM050_Zero_U8X;
+	if (mdata_x != BMM050_FLIP_OVERFLOW_ADCVAL	/* no overflow */
+	   ) {
+		if (data_r != 0) {
+			inter_retval = ((((float)p_bmm050->dig_xyz1)*16384.0f
+				/data_r)-16384.0f);
+		} else {
+			inter_retval = 0;
+		}
+		inter_retval = (((mdata_x * ((((((float)p_bmm050->dig_xy2) *
+			(inter_retval*inter_retval / 268435456.0f) +
+			inter_retval*((float)p_bmm050->dig_xy1)/16384.0f))
+			+ 256.0f) *	(((float)p_bmm050->dig_x2) + 160.0f)))
+			/ 8192.0f) + (((float)p_bmm050->dig_x1) * 8.0f))/16.0f;
+	} else {
+		inter_retval = BMM050_OVERFLOW_OUTPUT_FLOAT;
+	}
+	return inter_retval;
+}
+#endif
+
 BMM050_S16 bmm050_compensate_Y(BMM050_S16 mdata_y, BMM050_U16 data_r)
 {
 	BMM050_S16 inter_retval = BMM050_Zero_U8X;
@@ -1003,6 +1166,31 @@ BMM050_S32 bmm050_compensate_Y_s32 (BMM050_S16 mdata_y, BMM050_U16 data_r)
 		retval = BMM050_OVERFLOW_OUTPUT_S32;
 	return retval;
 }
+
+#ifdef ENABLE_FLOAT
+float bmm050_compensate_Y_float(BMM050_S16 mdata_y, BMM050_U16 data_r)
+{
+	float inter_retval = BMM050_Zero_U8X;
+	if (mdata_y != BMM050_FLIP_OVERFLOW_ADCVAL /* no overflow */
+	   ) {
+		if (data_r != 0) {
+			inter_retval = ((((float)p_bmm050->dig_xyz1)*16384.0f
+			/data_r)-16384.0f);
+		} else {
+			inter_retval = 0;
+		}
+		inter_retval = (((mdata_y * ((((((float)p_bmm050->dig_xy2) *
+			(inter_retval*inter_retval / 268435456.0f) +
+			inter_retval * ((float)p_bmm050->dig_xy1)/16384.0f)) +
+			256.0f) * (((float)p_bmm050->dig_y2) + 160.0f)))
+			/ 8192.0f) + (((float)p_bmm050->dig_y1) * 8.0f))/16.0f;
+	} else {
+		/* overflow, set output to 0.0f */
+		inter_retval = BMM050_OVERFLOW_OUTPUT_FLOAT;
+	}
+	return inter_retval;
+}
+#endif
 
 BMM050_S16 bmm050_compensate_Z(BMM050_S16 mdata_z, BMM050_U16 data_r)
 {
@@ -1049,6 +1237,24 @@ BMM050_S32 bmm050_compensate_Z_s32(BMM050_S16 mdata_z, BMM050_U16 data_r)
 	}
 		return retval;
 }
+
+#ifdef ENABLE_FLOAT
+float bmm050_compensate_Z_float (BMM050_S16 mdata_z, BMM050_U16 data_r)
+{
+	float inter_retval = BMM050_Zero_U8X;
+	if (mdata_z != BMM050_HALL_OVERFLOW_ADCVAL /* no overflow */
+	   ) {
+		inter_retval = ((((((float)mdata_z)-((float)p_bmm050->dig_z4))*
+		131072.0f)-(((float)p_bmm050->dig_z3)*(((float)data_r)-
+		((float)p_bmm050->dig_xyz1))))/((((float)p_bmm050->dig_z2)+
+		((float)p_bmm050->dig_z1)*((float)data_r)/32768.0)*4.0))/16.0;
+	} else {
+		/* overflow, set output to 0.0f */
+		inter_retval = BMM050_OVERFLOW_OUTPUT_FLOAT;
+	}
+	return inter_retval;
+}
+#endif
 
 BMM050_RETURN_FUNCTION_TYPE bmm050_set_control_measurement_x(
 unsigned char enable_disable)
@@ -1137,7 +1343,7 @@ BMM050_RETURN_FUNCTION_TYPE bmm050_soft_reset(void)
 BMM050_RETURN_FUNCTION_TYPE bmm050_get_raw_xyz(struct bmm050_mdata *mdata)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
-	unsigned char a_data_u8r[8] = { 0 };
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 	if (p_bmm050 == BMM050_NULL) {
 		return  E_BMM050_NULL_PTR;
 	} else {
@@ -1180,7 +1386,7 @@ BMM050_RETURN_FUNCTION_TYPE bmm050_get_bmx055_remapped_raw_xyz(
 struct bmm050_remapped_mdata *mdata)
 {
 	BMM050_RETURN_FUNCTION_TYPE comres = BMM050_Zero_U8X;
-	unsigned char a_data_u8r[8] = { 0 };
+	unsigned char a_data_u8r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 	if (p_bmm050 == BMM050_NULL) {
 		return  E_BMM050_NULL_PTR;
 	} else {

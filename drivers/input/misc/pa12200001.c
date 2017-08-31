@@ -2,8 +2,8 @@
  * This file is part of the PA12200001 sensor driver.
  * PA12200001 is combined proximity, ambient light sensor and IRLED.
  *
- * Contact: Alan Hsiao <alanhsiao@txc.com.tw>
- *
+ * Contact: Alan Hsiao  <alanhsiao@txc.com.tw>
+ *	    Chester Hsu <chesterhsu@txc.com.tw>
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * version 2 as published by the Free Software Foundation.
@@ -18,19 +18,23 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301 USA
  *
-*/
+ *Reversion
+ *1.06 : fix ioctl bugs
+ *1.07 : fix interrupt bugs
 
+*/
+//#define DEBUG
+#define pr_fmt(fmt)      "%s: " fmt, __func__
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/i2c.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
 #include <linux/input.h>
 #include <linux/string.h>
 #include <linux/irq.h>
-#include <linux/interrupt.h>
-#include <linux/gpio.h>
 #include <linux/fs.h>
 #include <linux/errno.h>
 #include <linux/device.h>
@@ -39,1194 +43,1333 @@
 #include <linux/wakelock.h>
 #include <linux/workqueue.h>
 #include <linux/uaccess.h>
-//#include <linux/earlysuspend.h> //changed by taokai 2014.7.1
-#include <asm/atomic.h>
-#include <linux/sensors/pa12200001.h>
-#include <linux/sensors/alsprox_common.h>
-#include <linux/sensors/sensparams.h>
-
-#include <linux/of.h>
+#include <linux/regulator/consumer.h>
+#include <linux/sensors.h>
+#ifdef CONFIG_OF
 #include <linux/of_gpio.h>
+#endif
+#ifdef CONFIG_HAS_EARLYSUSPEND
+#include <linux/earlysuspend.h>
+#endif
 
-//#include <linux/yl_pt_ap_feature.h>
+#include <asm/atomic.h>
+#include "pa12200001.h"
 
+#define PA12200001_DRV_NAME	"pa12200001"
+#define DRIVER_VERSION		"1.06"
+#define PA1220_PAELLA_CAL_MULT	25
+#define PA1220_PAELLA_CAL_DIV	10
 
-#define PA12200001_DRV_NAME "pa12200001"
-#define DRIVER_VERSION      "1.00"
+#define MISC_DEV_NAME		"alsps_dev"
+#define PS_CAL_FILE_PATH	"/persist/xtalk_cal"
+#define THRD_CAL_FILE_PATH	"/data/thrd_cal" //Threshold Calbration file path
 
-//#define DEVICE_NAME_ALPS  ALSPROX_INPUT_NAME
+#define ABS_LIGHT			0x28
+#define PS_POLLING_RATE		100
 
-
-#define PA12_IOCTL_ALS_ON            ALSPROX_IOCTL_ALS_ON
-#define PA12_IOCTL_ALS_OFF           ALSPROX_IOCTL_ALS_OFF
-#define PA12_IOCTL_PROX_ON           ALSPROX_IOCTL_PROX_ON
-#define PA12_IOCTL_PROX_OFF          ALSPROX_IOCTL_PROX_OFF
-#define PA12_IOCTL_PROX_CALIBRATE    ALSPROX_IOCTL_PROX_CALIBRATE
-#define PA12_IOCTL_PROX_OFFSET       ALSPROX_IOCTL_PROX_OFFSET
-#define PA12_IOCTL_PHONE_STATE       ALSPROX_IOCTL_PHONE_STATE
-
-#define APS_TAG                  "[pa12200001]: "
-#define APS_FUN(f)               pr_info(APS_TAG"%s\n", __FUNCTION__)
-#define APS_ERR(fmt, args...)    pr_err(APS_TAG"%s %d : "fmt, __FUNCTION__, __LINE__, ##args)
-#define APS_LOG(fmt, args...)    pr_info(APS_TAG fmt, ##args)
-#define APS_DBG(fmt, args...)    pr_debug(APS_TAG"%s : "fmt, __FUNCTION__, ##args)
-
-
-static int prox_active = 0;
-static int light_active = 0;
-unsigned short cal_tmp[4]={0};
+static int pa12200001_open(struct inode *inode, struct file *file);
+static int pa12200001_release(struct inode *inode, struct file *file);
+static long pa12200001_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static int pa12200001_run_fast_calibration(struct i2c_client *client);
 
 struct pa12200001_data {
+    struct 		i2c_client *client;
+    struct 		mutex lock;
+    struct 		pa12200001_platform_data *pdata;
 
-    struct      i2c_client *client;
-    struct      mutex lock;
-    int         irq;
-    struct      pa12200001_platform_data *pdata;
+    struct 		workqueue_struct *wq;
+#ifdef CONFIG_HAS_EARLYSUSPEND
+    struct early_suspend early_suspend;
+#endif
 
-    struct      workqueue_struct *wq;
-//  struct      early_suspend early_suspend;//changed by taokai 2014.7.1
+#ifdef USE_LIGHT_FEATURE
+    struct 		input_dev *light_input_dev;
+#endif
+    struct 		work_struct work_light;
+#ifdef USE_LIGHT_FEATURE
+    struct 		hrtimer light_timer;
+    ktime_t 	light_poll_delay;
+#endif
+	struct		wake_lock ps_wakelock;
+    struct 		input_dev *proximity_input_dev;
+    struct 		work_struct work_proximity;
+    struct 		work_struct work_irq;
+    struct 		hrtimer proximity_timer;
+    ktime_t 	proximity_poll_delay;
+    ulong 		enable;
 
-    struct      input_dev *light_input_dev;
-    //struct      input_dev  *input_dev;
-
-    struct      work_struct work_light;
-    struct      hrtimer light_timer;
-    ktime_t     light_poll_delay;
-
-    struct      input_dev *proximity_input_dev;
-    struct      work_struct work_proximity;
-    struct      hrtimer proximity_timer;
-    ktime_t     proximity_poll_delay;
-
-    struct      wake_lock prx_wake_lock;
-    ulong       enable;
-
-    unsigned int       als_ps_int;
+    int          ps_enable;
+    int          als_enable;
+	int pre_lux;
     /* PS Calibration */
-    u16         crosstalk;
-    u8      crosstalk_base;
+    u8 		crosstalk;
+    u8 		crosstalk_base;
+    int      cal_result;
+
+    /* threshold */
+    u8		ps_thrd_low;
+    u8		ps_thrd_high;
+    u8		irq_enabled;
+    int irq_gpio;
+    int irq;
+    struct regulator *vdd;
+    unsigned int irq_gpio_flags;
+	struct sensors_classdev ps_cdev;
+	int ps_stat;
 };
 
+static struct sensors_classdev sensors_proximity_cdev = {
+	.name = "proximity",
+	.vendor = "pa12200001",
+	.version = 1,
+	.handle = SENSORS_PROXIMITY_HANDLE,
+	.type = SENSOR_TYPE_PROXIMITY,
+	.max_range = "5",
+	.resolution = "5.0",
+	.sensor_power = "3",
+	.min_delay = 1000,	/* in microseconds */
+	.fifo_reserved_event_count = 0,
+	.fifo_max_event_count = 0,
+	.enabled = 0,
+	.delay_msec = 100,
+	.sensors_enable = NULL,
+	.sensors_poll_delay = NULL,
+};
 
-
-struct pa12200001_data *this_data;
-
-/*
- * pa12200001 range
- */
+#ifdef USE_LIGHT_FEATURE
+/* pa12200001 range*/
 static int pa12200001_range[4] = {149,1363,2833,13897};
-u8 suspend_mode;
+#endif
 
 /* Object status, near=0, far=1 */
 static int intr_flag = 1;
-static int temp_flag = 1;
 
-/*
- * Set the polling mode(=1) or int mode(=0) here.
- * Please check PA12_PS_SET in pa12200001.h */
-u8 als_polling  = 1;
-u8 ps_polling   = 0;
-/* Please check PA12_PS_SET in pa12200001.h */
-
-/*----------------------------------------------------------------------------*/
-/* I2C Read */
-static int i2c_read_reg(struct i2c_client *client,u8 reg,u8 *data)
-{
-  //u8 reg_value[1];
-    u8 databuf[2];
-    int res = 0;
-    int i=0;
-    databuf[0]= reg;
-
-    for(i=0;i < I2C_RETRY;i++){
-      if(i2c_master_send(client,databuf,0x1) < 0){
-        APS_ERR("i2c_master_send function err\n");
-        msleep_interruptible(I2C_RETRY_DELAY);
-        res= -1;
-      }else{
-        res=0;
-        break;
-      }
-    }
-
-    for(i=0;i < I2C_RETRY ;i++){
-      if(i2c_master_recv(client,data,0x1) < 0){
-        APS_ERR("i2c_master_recv function err\n");
-        msleep_interruptible(I2C_RETRY_DELAY);
-        res= -1;
-      }else{
-        res=0;
-        break;
-      }
-    }
-    return res;
-}
-/* I2C Write */
-static int i2c_write_reg(struct i2c_client *client,u8 reg,u8 value)
-{
-
-    u8 databuf[2];
-    int res=0;
-    int i=0;
-
-    databuf[0] = reg;
-    databuf[1] = value;
-    for(i=0;i < I2C_RETRY ;i++){
-      if(i2c_master_send(client,databuf,0x2) < 0){
-        APS_ERR("i2c_master_send function err\n");
-        msleep_interruptible(I2C_RETRY_DELAY);
-        res=-1;
-
-      }else{
-        res=0;
-        break;
-      }
-    }
-
-    return res;
-}
-/****************************************/
-/*
-          calibrate
-*/
-/****************************************/
-extern int yl_params_kernel_emmc_write(const char *buf,size_t count);
-extern int yl_params_kernel_emmc_read(const char *buf,size_t count);
-
-/*
-static void pa12200001_write_crosstalk_to_flash(unsigned char* input)
-{
-    struct ProductlineInfo Info;
-    APS_LOG("%s: write input = %s\n",__func__, input);
-    memcpy(&Info.SyncByte, "PRODUCTLINE", sizeof("PRODUCTLINE"));
-    yl_params_kernel_emmc_read((char*)&Info, 512);
-    if(NULL != input){
-        memcpy(&Info.LightProxInfo, input, 4);
-    }
-    yl_params_kernel_emmc_write((char*)&Info, sizeof(struct ProductlineInfo));
-}
-static void pa12200001_read_crosstalk_from_flash(unsigned char* output)
-{
-    struct ProductlineInfo Info;
-    memcpy(&Info.SyncByte, "PRODUCTLINE", sizeof("PRODUCTLINE"));
-    yl_params_kernel_emmc_read((char*)&Info, 512);
-    if(NULL != output){
-        memcpy(output, &Info.LightProxInfo, 4);
-    }
-    APS_LOG("%s: read output = %s\n", __func__, output);
-}
+/* Global Variant */
+static bool pa122_has_load_param = false;
+static int bCal_flag=0;
+#ifdef USE_LIGHT_FEATURE
+static int ALSTemp[10];
+static int ALSTempIndex=0;
+static int ALSAVGStart=0;
 #endif
-*/
+//static u8  PS_PRAM[4]={0,0,0,0}; // 0: Xtalk_offset 1:xtalk_value 2: PS_Threshold_low 3: PS_Threshold_high
 
-/*----------------------------------------------------------------------------*/
-/*
- * internally used functions
- */
-static int pa12200001_set_ps_prst(struct i2c_client *client,int pts)
+struct i2c_client *pa12_i2c_client = NULL;
+static int i2c_read_reg(struct i2c_client *client,u8 reg,u8 *buf)
 {
-    int ret;
-    u8 regdata = 0;
-    mutex_lock(&this_data->lock);
-    ret=i2c_read_reg(client, REG_CFG1, &regdata);
-    regdata = regdata & 0xF3; //clear PS PRST bits
-    switch(pts){
-    case 1:
-        regdata = regdata | 0x04 ;
-        break;
-    case 2:
-        regdata = regdata | 0x08 ;
-        break;
-    case 3:
-        regdata = regdata | 0x0C ;
-        break;
-    default:
-        break;
+    int ret = 0;
+    int i = 0;
+	struct pa12200001_data *data = i2c_get_clientdata(client);
+
+    for (i = 0; i < I2C_RETRY_TIMES;i++){
+		mutex_lock(&data->lock);
+        ret = i2c_smbus_read_byte_data(client, reg);
+		mutex_unlock(&data->lock);
+        if (ret < 0) {
+            pr_err("failed to read 0x%x, slave_addr=0x%x\n", reg, client->addr);
+            msleep(I2C_RETRY_DELAY);
+        } else {
+            *buf = (u8) ret;
+            return 0;	//success
+        }
     }
-    ret=i2c_write_reg(client,REG_CFG1,regdata);//set PS PRST
-    mutex_unlock(&this_data->lock);
+
     return ret;
 }
-static int pa12200001_clear_intr(struct i2c_client *client)
+
+static int i2c_write_reg(struct i2c_client *client,u8 reg,u8 value)
 {
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    u8  regdata;
-    int ret;
+    int ret = 0;
+    int i = 0;
+	struct pa12200001_data *data = i2c_get_clientdata(client);
 
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_CFG2, &regdata);
-    ret = i2c_write_reg(client, REG_CFG2, regdata & 0xFC);
-    mutex_unlock(&data->lock);
+    for (i = 0;i < I2C_RETRY_TIMES; i++){
+		mutex_lock(&data->lock);
+        ret = i2c_smbus_write_byte_data(client, reg, value);
+		mutex_unlock(&data->lock);
+        if (ret < 0) {
+            pr_err("failed to write 0x%x, slave_addr=0x%x\n", reg, client->addr);
+            msleep(I2C_RETRY_DELAY);
+        } else {
+            return 0;	//success
+        }
+    }
+    return ret;
+}
 
-    if (ret < 0){
-        APS_ERR("i2c_read function err\n");
+static int pa12200001_read_file(char *filename,u8* param)
+{
+    struct file *fop;
+    mm_segment_t old_fs;
+	loff_t pos = 0;
+	char buf[8];
+	int ret;
+	unsigned int a, b;
+
+    fop = filp_open(filename,O_RDONLY,0);
+    if (IS_ERR(fop)){
+        pr_err("open file %s failed !\n",filename);
         return -1;
     }
+
+    old_fs = get_fs();
+    set_fs(get_ds()); //set_fs(KERNEL_DS);
+    ret = vfs_read(fop, buf, 8, &pos);
+	if (ret > 0) {
+		sscanf(buf, "%u %u\n", &a, &b);
+		param[0] = (u8)a;
+		param[1] = (u8)b;
+	}
+    set_fs(old_fs);
+
+    filp_close(fop,NULL);
     return 0;
 }
-/* mode */
+
+static ssize_t pa12200001_write_file(char *filename, u8* param)
+{
+    struct file *fop;
+    mm_segment_t old_fs;
+	loff_t pos = 0;
+	char buf[8];
+	int ret;
+
+    fop = filp_open(filename, O_CREAT|O_RDWR, 0644);
+    if (IS_ERR(fop)){
+        pr_err("create file %s failed !\n", filename);
+        return -1;
+    }
+	snprintf(buf, sizeof(buf), "%03u %03u",
+		     param[0], param[1]);
+
+    old_fs = get_fs();
+    set_fs(get_ds()); //set_fs(KERNEL_DS);
+    ret = vfs_write(fop, buf, strlen(buf), &pos);
+	if (ret != strlen(buf))
+		pr_err("write file failed !\n");
+    set_fs(old_fs);
+
+    filp_close(fop,NULL);
+    return 0;
+}
+
 static int pa12200001_get_mode(struct i2c_client *client)
 {
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8  regdata=0;//csl modify 20140107
-
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_CFG0, &regdata);
-    mutex_unlock(&data->lock);
-    return (regdata & 0x03);//get ps and als mode
+    u8 data =0;
+    i2c_read_reg(client, REG_CFG0, &data);
+    return (data & 0x03);
 }
 
 static int pa12200001_set_mode(struct i2c_client *client, int mode)
 {
     struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8  regdata=0;//csl modify 20140107
+    int	ret;
+	u8 buftemp[2]={0};
+    u8 regdata = 0;
+	int previous_mode = pa12200001_get_mode(client);
+	int ps_already_enabled = (previous_mode & PS_ACTIVE) >> 1;
 
-    if (mode != pa12200001_get_mode(client))
-    {
-        if (als_polling)
-        {
+    pr_debug("mode = 0x%x\n", (u32)mode);
+
+    data->ps_enable=((PS_ACTIVE & mode)>>1);
+    data->als_enable=(ALS_ACTIVE & mode);
+
+	if (!pa122_has_load_param) {
+		pa122_has_load_param = true;
+	    /* Check ps calibration file */
+	    if(pa12200001_read_file(PS_CAL_FILE_PATH,buftemp)<0){
+	        pr_warn("read file faild, use default offset\n");
+
+	        buftemp[1] = data->crosstalk_base=10;
+	        buftemp[0] = data->crosstalk=PA12_PS_OFFSET_DEFAULT+PA12_PS_OFFSET_EXTRA;
+	        pa12200001_write_file(PS_CAL_FILE_PATH,buftemp); //Create x-tal_cal file
+	    } else {
+            if(buftemp[0] != 0) {
+                pr_info("use cal file, x-talk=%d, base=%d\n",buftemp[0],buftemp[1]);
+                data->crosstalk=buftemp[0];
+                data->crosstalk_base=buftemp[1];
+            } else {
+                pr_info("xtalk read 0, crosstalk=%u\n", data->crosstalk);
+            }
+
+            data->ps_thrd_low = PA12_PS_TH_LOW2;
+            data->ps_thrd_high = PA12_PS_TH_HIGH2;
+	    }
+	    i2c_write_reg(client,REG_PS_OFFSET,data->crosstalk); //X-talk Cancelling
+	    data->cal_result = 0;
+	}
+
+    if(data->ps_enable && PA12_FAST_CAL && !ps_already_enabled)
+        pa12200001_run_fast_calibration(client);
+
+#ifdef USE_LIGHT_FEATURE
+    if(data->als_enable & ALS_AVG_ENABLE)
+        ALSAVGStart=1;
+#endif
+
+    if (mode != previous_mode) {
+#ifdef USE_LIGHT_FEATURE
+        if (ALS_POLLING) {
             /* Enable/Disable ALS */
-            if (ALS_ACTIVE & mode)
+            if (ALS_ACTIVE & mode) {
                 hrtimer_start(&data->light_timer, data->light_poll_delay, HRTIMER_MODE_REL);
-            else
-            {
+            } else {
                 hrtimer_cancel(&data->light_timer);
                 cancel_work_sync(&data->work_light);
             }
         }
+#endif
 
-        if (ps_polling)
-        {
+        if (PS_POLLING) {
             /* Enable/Disable PS */
-            if ((mode & 0x02) == PS_ACTIVE)
-            {
-                //wake_lock(&data->prx_wake_lock);
+            if ((PS_ACTIVE & mode)>>1) {
                 hrtimer_start(&data->proximity_timer, data->proximity_poll_delay, HRTIMER_MODE_REL);
-            }
-            else
-            {
-                //wake_unlock(&data->prx_wake_lock);
+            } else {
                 hrtimer_cancel(&data->proximity_timer);
                 cancel_work_sync(&data->work_proximity);
             }
         }
 
-        APS_LOG("mode: %d\n",mode);
+		if (data->ps_enable && !ps_already_enabled) {
+			u8 buf;
+			i2c_write_reg(client, REG_PS_TH, 0xFF);
+			i2c_write_reg(client, REG_PS_TL, 0x00);
+			i2c_read_reg(client, REG_CFG2, &buf);
+			i2c_write_reg(client, REG_CFG2, buf & 0xFD);
+		}
 
-        mutex_lock(&data->lock);
         ret = i2c_read_reg(client, REG_CFG0, &regdata);
         regdata = regdata & 0xFC;
         ret = i2c_write_reg(client, REG_CFG0, regdata | mode);
-        mutex_unlock(&data->lock);
+
+		if (data->ps_enable && !ps_already_enabled) {
+			msleep(50);
+            if(data->ps_thrd_low == PA12_PS_TH_LOW2&&data->ps_thrd_high == PA12_PS_TH_HIGH2) {
+                i2c_write_reg(client, REG_PS_TH, PA12_PS_TH_HIGH2);
+                i2c_write_reg(client, REG_PS_TL, PA12_PS_TH_LOW2);
+            } else {
+                i2c_write_reg(client, REG_PS_TH, PA12_PS_TH_HIGH);
+                i2c_write_reg(client, REG_PS_TL, PA12_PS_TH_LOW);
+            }
+		}
     }
     return 0;
 }
 
-
-static int pa12200001_ps_enable(int flag)
-{
-    u8 regdata;
-printk("zb test :enter %s flag=%d at %d\n",__func__,flag,__LINE__);
-    if(flag){
-        mutex_lock(&this_data->lock);
-        i2c_read_reg(this_data->client, REG_CFG0, &regdata);
-        regdata = regdata & 0xFD;
-        i2c_write_reg(this_data->client, REG_CFG0, regdata | 0x02);
-        mutex_unlock(&this_data->lock);
-        /* If use ps_polling start timer */
-        if(ps_polling){
-        hrtimer_start(&this_data->proximity_timer, this_data->proximity_poll_delay, HRTIMER_MODE_REL);
-        }
-    }
-   else{
-    mutex_lock(&this_data->lock);
-        i2c_read_reg(this_data->client, REG_CFG0, &regdata);
-        regdata = regdata & 0xFD;//close ps
-        i2c_write_reg(this_data->client, REG_CFG0, regdata);
-        mutex_unlock(&this_data->lock);
-        /* If use ps_polling stop timer */
-        if(ps_polling){
-        hrtimer_cancel(&this_data->proximity_timer);
-        cancel_work_sync(&this_data->work_proximity);
-        }
-    }
-    return 0;
-}
-
-static int pa12200001_als_enable(int flag)
-{
-    u8 regdata;
-    if(flag){
-        mutex_lock(&this_data->lock);
-        i2c_read_reg(this_data->client, REG_CFG0, &regdata);
-        regdata = regdata & 0xFE;//first clean 0
-        i2c_write_reg(this_data->client, REG_CFG0, regdata | 0x01);//enable als
-        mutex_unlock(&this_data->lock);
-        if(als_polling){
-        hrtimer_start(&this_data->light_timer, this_data->light_poll_delay, HRTIMER_MODE_REL);
-        }
-    }else{
-        mutex_lock(&this_data->lock);
-        i2c_read_reg(this_data->client, REG_CFG0, &regdata);
-        regdata = regdata & 0xFE;
-        i2c_write_reg(this_data->client, REG_CFG0, regdata);
-        mutex_unlock(&this_data->lock);
-        if(als_polling){
-        hrtimer_cancel(&this_data->light_timer);
-        cancel_work_sync(&this_data->work_light);
-        }
-    }
-    return 0;
-}
+#ifdef USE_LIGHT_FEATURE
 /* range */
 static int pa12200001_get_range(struct i2c_client *client)
 {
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret = 0;
-    u8  regdata=0;//csl modify 20140107
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_CFG0, &regdata);
-    mutex_unlock(&data->lock);
-    return ((regdata >> 4) & 0x03);//to get the afsr
+    u8 data = 0;
+    i2c_read_reg(client, REG_CFG0, &data);
+    return ((data >> 4) & 0x03);
 }
-/*static int pa12200001_set_range(struct i2c_client *client, int range)
+#endif
+
+#if 0
+static int pa12200001_set_range(struct i2c_client *client, int range)
 {
-    struct pa12200001_data *data;
     int ret;
-    u8  regdata;
+    u8 data =0;
 
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_CFG0, &regdata);
-    regdata = regdata & 0x03;
-    regdata = regdata | (range << 4);
-    ret = i2c_write_reg(client, REG_CFG0, regdata);
-    mutex_unlock(&data->lock);
-
-    return ret;
-}*/
-
-/* ALS set threshold */
-/*
-static int pa12200001_set_althres(struct i2c_client *client, int val)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8  msb, lsb;
-
-    msb = val >> 8;
-    lsb = val & 0xFF;
-
-    mutex_lock(&data->lock);
-    ret = i2c_write_reg(client, REG_ALS_TL_LSB, lsb);
-    ret = i2c_write_reg(client, REG_ALS_TL_MSB, msb);
-    mutex_unlock(&data->lock);
+    ret = i2c_read_reg(client, REG_CFG0, &data);
+    data = data & 0x03;
+    data = data | (range << 4);
+    ret = i2c_write_reg(client, REG_CFG0, data);
 
     return ret;
 }
+#endif
 
-static int pa12200001_set_ahthres(struct i2c_client *client, int val)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8  msb, lsb;
-
-    msb = val >> 8;
-    lsb = val & 0xFF;
-
-    mutex_lock(&data->lock);
-    ret = i2c_write_reg(client, REG_ALS_TH_LSB, lsb);
-    ret = i2c_write_reg(client, REG_ALS_TH_MSB, msb);
-    mutex_unlock(&data->lock);
-
-    return ret;
-}
-*/
-
-/* PX get threshold */
-/*
-static int pa12200001_get_plthres(struct i2c_client *client)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8 regdata;
-
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_PS_TL, &regdata);
-    mutex_unlock(&data->lock);
-
-    return regdata;
-}
-
-
-static int pa12200001_get_phthres(struct i2c_client *client)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8 regdata;
-
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_PS_TH, &regdata);
-    mutex_unlock(&data->lock);
-
-    return regdata;
-}
-*/
-/* PX set threshold */
-static int pa12200001_set_plthres(struct i2c_client *client, int val)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-
-    mutex_lock(&data->lock);
-    ret = i2c_write_reg(client, REG_PS_TL, val);
-    mutex_unlock(&data->lock);
-
-    return ret;
-}
-
-static int pa12200001_set_phthres(struct i2c_client *client, int val)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-
-    mutex_lock(&data->lock);
-    ret = i2c_write_reg(client, REG_PS_TH, val);
-    mutex_unlock(&data->lock);
-
-    return ret;
-}
-
-/*
-static int pa12200001_set_pscrosstalk(struct i2c_client *client, int val)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-
-    mutex_lock(&data->lock);
-    ret = i2c_write_reg(client, REG_PS_OFFSET, val);
-    mutex_unlock(&data->lock);
-
-    return ret;
-}*/
 static int pa12200001_get_pscrosstalk(struct i2c_client *client)
 {
-    struct pa12200001_data *data = i2c_get_clientdata(client);
     int ret;
-    u8  regdata=0;//csl modify 20140107
-
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_PS_OFFSET, &regdata);
-    mutex_unlock(&data->lock);
-
-    return regdata;
+    u8 data = 0;
+    ret = i2c_read_reg(client, REG_PS_OFFSET, &data);
+    return data;
 }
+
 void pa12_swap(u8 *x, u8 *y)
 {
-        u8 temp = *x;
-        *x = *y;
-        *y = temp;
+    u8 temp = *x;
+    *x = *y;
+    *y = temp;
 }
+
+static int pa12200001_thrd_calibration(struct i2c_client *client)
+{
+    struct pa12200001_data *data = i2c_get_clientdata(client);
+    int i,j,temp_diff;
+    u16 sum_of_pdata = 0;
+    u8 temp_pdata[10],buftemp[2],cfg0data=0,temp_thrd;
+    unsigned int ArySize = 10;
+
+    pr_debug("START threshold calibration\n");
+
+    i2c_read_reg(client, REG_CFG0, &cfg0data);
+    i2c_write_reg(client, REG_CFG0, cfg0data | 0x02); /*PS On*/
+
+    for(i = 0; i < 10; i++){
+        mdelay(50);
+        i2c_read_reg(client,REG_PS_DATA,temp_pdata+i);
+        pr_debug("ps temp_data = %d\n", temp_pdata[i]);
+    }
+
+    /* pdata sorting */
+    for (i = 0; i < ArySize - 1; i++) {
+        for (j = i+1; j < ArySize; j++) {
+            if (temp_pdata[i] > temp_pdata[j])
+                pa12_swap(temp_pdata + i, temp_pdata + j);
+        }
+    }
+
+    /* calculate the cross-talk using central 5 data */
+    for (i = 3; i < 8; i++) {
+        pr_debug("temp_pdata = %d\n", temp_pdata[i]);
+        sum_of_pdata = sum_of_pdata + temp_pdata[i];
+    }
+
+    temp_thrd = sum_of_pdata/5;
+    temp_diff = temp_thrd - (data->crosstalk_base+PA12_PS_TH_BASE_HIGH);
+    if(temp_diff < 0){
+        pr_debug("Threshold Cal fail \n");
+        return -1 ;
+
+    }else{
+		buftemp[1]=temp_thrd; // High Treshold
+
+        if (data->crosstalk > 50) {
+            if((temp_thrd -80) > data->crosstalk_base)
+                buftemp[0]=temp_thrd - 80 ;
+            else
+                buftemp[0]=(data->crosstalk_base+PA12_PS_TH_BASE_LOW);
+        } else {
+            if((temp_thrd -40) > data->crosstalk_base)
+                buftemp[0]=temp_thrd - 40 ;
+            else
+                buftemp[0]=(data->crosstalk_base+PA12_PS_TH_BASE_LOW);
+        }
+
+        data->ps_thrd_low=buftemp[0];
+        data->ps_thrd_high=buftemp[1];
+
+        if(pa12200001_write_file(THRD_CAL_FILE_PATH,buftemp)<0)  //Write to file
+            pr_err("Create PS Thredhold calibration file error!!");
+        else
+            pr_debug("Create PS Thredhold calibration file Success!!");
+    }
+    return 0;
+}
+
+
+static DEFINE_MUTEX(calibrate_lock);
+
 static int pa12200001_run_calibration(struct i2c_client *client)
 {
     struct pa12200001_data *data = i2c_get_clientdata(client);
     int i, j;
     int ret;
-    u16 sum_of_pdata = 0,als_data=0;
-    u8 temp_pdata[20];//csl modify 20140107
-    int xtalk_data=0;
-    u8 cfg0data=0, cfg2data=0;
-     u8 temp_als_data[2];
+    u16 sum_of_pdata = 0;
+    u8 temp_pdata[20],buftemp[2],cfg0data=0,cfg2data=0;
     unsigned int ArySize = 20;
+    unsigned int cal_check_flag = 0;
 
-    if(ps_polling){
-        hrtimer_cancel(&this_data->proximity_timer);
-        cancel_work_sync(&this_data->work_proximity);
-    }
-  APS_LOG("%s: START proximity sensor calibration\n", __func__);
-    sum_of_pdata = 0;
-    mutex_lock(&data->lock);
+    pr_debug("START proximity sensor calibration\n");
+	
+	mutex_lock(&calibrate_lock);
+RECALIBRATION:
+	/* Prevent Interrupt */
+	ret = i2c_write_reg(client, REG_PS_TH, 0xFF);
+	ret = i2c_write_reg(client, REG_PS_TL, 0x00);
 
-    i2c_read_reg(client, REG_CFG0, &cfg0data);
-    i2c_write_reg(client, REG_CFG0, (cfg0data & 0xCF) | 0x03);  /* PS &ALS Enable ALS Gain = 125 lux */
+    ret = i2c_read_reg(client, REG_CFG2, &cfg2data);
+    ret = i2c_write_reg(client, REG_CFG2, cfg2data & 0x33); /*Offset mode & disable intr from ps*/
+    ret = i2c_write_reg(client, REG_PS_OFFSET, 0x00); /*Set crosstalk = 0*/
 
-    i2c_read_reg(client, REG_CFG2, &cfg2data);
-    i2c_write_reg(client, REG_CFG2, cfg2data & 0x28); /*Offset mode & disable intr from ps*/
+    ret = i2c_read_reg(client, REG_CFG0, &cfg0data);
+    ret = i2c_write_reg(client, REG_CFG0, cfg0data | 0x02); /*PS On*/
 
-    i2c_write_reg(client, REG_PS_OFFSET, 0x00);//csl modify 20140107 //Set crosstalk = 0
-
-    msleep(200);  //Intergrating Time need 100ms
-  i2c_read_reg(client, REG_ALS_DATA_LSB, temp_als_data);
-  i2c_read_reg(client, REG_ALS_DATA_MSB, temp_als_data+1);
-  als_data=(temp_als_data[1] << 8 )|(temp_als_data[0]);
-  if(als_data > PA12_CAL_MAX_ALS_COUNT)
-    {
-            APS_LOG("%s: ALS ENVIRONMENT IS TOO BRIGHT-> "
-                               "cross_talk is set to DEFAULT\n", __func__);
-            //data->crosstalk = PA12_PS_OFFSET_DEFAULT;
-            //i2c_write_reg(client, REG_PS_OFFSET, data->crosstalk);
-            i2c_write_reg(client, REG_CFG0, cfg0data);
-            i2c_write_reg(client, REG_CFG2, cfg2data | 0xC0);
-            mutex_unlock(&data->lock);
-            return 3;//TOO Bright
-    }
-    for(i = 0; i < 20; i++)
-   {
-          msleep(15);
+    for(i = 0; i < 20; i++){
+        mdelay(50);
         ret = i2c_read_reg(client,REG_PS_DATA,temp_pdata+i);
-        //APS_LOG("temp_data = %d\n", temp_pdata[i]);
+        pr_debug("temp_data = %d\n", temp_pdata[i]);
     }
-    mutex_unlock(&data->lock);
+
     /* pdata sorting */
     for (i = 0; i < ArySize - 1; i++)
         for (j = i+1; j < ArySize; j++)
             if (temp_pdata[i] > temp_pdata[j])
                 pa12_swap(temp_pdata + i, temp_pdata + j);
+
     /* calculate the cross-talk using central 10 data */
-    for (i = 14; i < 18; i++)
-    {
-        //APS_LOG("%s: temp_pdata = %d\n", __func__, temp_pdata[i]);
+    for (i = 5; i < 15; i++) {
+        pr_debug("temp_pdata = %d\n", temp_pdata[i]);
         sum_of_pdata = sum_of_pdata + temp_pdata[i];
     }
-    data->crosstalk = sum_of_pdata/4;
-    xtalk_data= (int) data->crosstalk ;
-    APS_LOG("%s: sum_of_pdata = %d   cross_talk = %d\n",
-                        __func__, sum_of_pdata, data->crosstalk);
-  /* Restore CFG2 (Normal mode) and Measure base x-talk */
-    mutex_lock(&data->lock);
-    i2c_write_reg(client, REG_CFG0, cfg0data);
-    i2c_write_reg(client, REG_CFG2, cfg2data | 0xC0);
-    mutex_unlock(&data->lock);
-    if (data->crosstalk > this_data->pdata->pa12_ps_offset_max)
-    {
-       //data->crosstalk = data->pdata->pa12_ps_offset_default;
-       //i2c_write_reg(client, REG_PS_OFFSET, data->crosstalk);
-       return 2;  //struct fail
-     }
-     data->crosstalk += PA12_PS_OFFSET_EXTRA;
 
-CROSSTALKBASE_RECALIBRATION:
-            mutex_lock(&data->lock);
-          i2c_write_reg(client, REG_CFG0, cfg0data | 0x02); //PS On
-        i2c_write_reg(client, REG_PS_OFFSET, data->crosstalk); //Write offset value to register 0x10
+    data->crosstalk = sum_of_pdata/10;
+    pr_debug("sum_of_pdata = %d, cross_talk = %d\n",
+            sum_of_pdata, data->crosstalk);
 
-        for(i = 0; i < 10; i++)
-        {
-            msleep(15);
-            i2c_read_reg(client,REG_PS_DATA,temp_pdata+i);
-            APS_LOG("temp_data = %d\n", temp_pdata[i]);
+    /* Restore CFG2 (Normal mode) and Measure base x-talk */
+    ret = i2c_write_reg(client, REG_CFG2, cfg2data | 0xC0); //make sure return normal mode
+
+    if (data->crosstalk > 50){
+        pr_debug("invalid calibrated data\n");
+
+        if(cal_check_flag == 0){
+            pr_debug("RECALIBRATION start\n");
+            cal_check_flag = 1;
+            goto RECALIBRATION;
+        }else{
+            pr_debug("CALIBRATION FAIL -> cross_talk is set to DEFAULT\n");
+            data->cal_result = -1;
+            data->crosstalk = PA12_PS_OFFSET_DEFAULT + PA12_PS_OFFSET_EXTRA;
+			ret = i2c_write_reg(client, REG_PS_OFFSET, data->crosstalk);
+			ret = i2c_write_reg(client, REG_PS_TH, PA12_PS_TH_HIGH);
+			ret = i2c_write_reg(client, REG_PS_TL, PA12_PS_TH_LOW);
+			mutex_unlock(&calibrate_lock);
+            return -EINVAL;
         }
+    }
 
-        mutex_unlock(&data->lock);
+	data->crosstalk += PA12_PS_OFFSET_EXTRA;
 
-        /* calculate the cross-talk_base using central 5 data */
+CROSSTALK_BASE_RECALIBRATION:
+    /*Write offset value to 0x10*/
+    ret = i2c_write_reg(client, REG_PS_OFFSET, data->crosstalk);
+    sum_of_pdata = 0;
 
-        sum_of_pdata = 0;
+    for(i = 0; i < 10; i++){
+        mdelay(50);
+        ret = i2c_read_reg(client,REG_PS_DATA,temp_pdata+i);
+        pr_debug("temp_data = %d\n", temp_pdata[i]);
+    }
 
-        for (i = 3; i < 8; i++)
-        {
-            APS_LOG("%s: temp_pdata = %d\n", __func__, temp_pdata[i]);
-            sum_of_pdata = sum_of_pdata + temp_pdata[i];
-        }
+    /* calculate the cross-talk_base using central 5 data */
+    for (i = 3; i < 8; i++) {
+        pr_debug("temp_pdata = %d\n", temp_pdata[i]);
+        sum_of_pdata = sum_of_pdata + temp_pdata[i];
+    }
 
-        data->crosstalk_base = sum_of_pdata/5;
-            APS_LOG("%s: sum_of_pdata = %d   cross_talk_base = %d\n",
-                            __func__, sum_of_pdata, data->crosstalk_base);
+    data->crosstalk_base = sum_of_pdata/5;
+    pr_debug("sum_of_pdata = %d, cross_talk_base = %d\n",
+             sum_of_pdata, data->crosstalk_base);
 
-        if(data->crosstalk_base > 0)
-        {
-            data->crosstalk += 1;
-            goto CROSSTALKBASE_RECALIBRATION;
-        }
-      mutex_lock(&data->lock);  //Restore CFG0
-      i2c_write_reg(client, REG_CFG0, cfg0data);
-        mutex_unlock(&data->lock);
-    APS_LOG("%s: FINISH proximity sensor calibration\n", __func__);
-    if(ps_polling)
-    { hrtimer_start(&data->proximity_timer, data->proximity_poll_delay, HRTIMER_MODE_REL);}
-    return 1;
+	if (data->crosstalk_base > 0) {
+		data->crosstalk += 1;
+		goto CROSSTALK_BASE_RECALIBRATION;
+	}
+
+    /* Restore CFG0  */
+	ret = i2c_write_reg(client, REG_PS_TH, PA12_PS_TH_HIGH);
+	ret = i2c_write_reg(client, REG_PS_TL, PA12_PS_TH_LOW);
+    ret = i2c_write_reg(client, REG_CFG0, cfg0data);
+
+    pr_debug("FINISH proximity sensor calibration\n");
+    /*Write x-talk info to file*/
+    buftemp[0]=data->crosstalk;//-PA12_PS_OFFSET_EXTRA;
+    buftemp[1]=data->crosstalk_base;
+
+	pr_info("write buftemp[0]=%u, buftemp[1]=%u\n", buftemp[0], buftemp[1]);
+    if(pa12200001_write_file(PS_CAL_FILE_PATH,buftemp)<0) {
+        pr_err("Open PS x-talk calibration file error!!");
+        data->cal_result = -2;
+		mutex_unlock(&calibrate_lock);
+		return -EFAULT;
+    } else {
+        pr_debug("Open PS x-talk calibration file Success!!");
+    }
+
+    data->cal_result = 0;
+	mutex_unlock(&calibrate_lock);
+    return data->crosstalk;
 }
-#if 1
-static int pa12200001_fast_run_calibration(struct i2c_client *client)
+
+static int pa12200001_run_fast_calibration(struct i2c_client *client)
 {
     struct pa12200001_data *data = i2c_get_clientdata(client);
-    int i, j;
+    int i=0;
+    int j=0;
     u16 sum_of_pdata = 0;
-        u8 temp_pdata[4];//csl modify 20140107
-    u8 cfg0data=0, cfg2data=0, cfg3data=0;
-
-        int xtalk_data=0;
-
+    u8  xtalk_temp=0;
+    u8 temp_pdata[4], cfg0data=0,cfg2data=0;//,cfg3data=0;
     unsigned int ArySize = 4;
 
-        APS_LOG("%s: START fast proximity sensor calibration\n", __func__);
+    if (bCal_flag & PA12_FAST_CAL_ONCE){
+        pr_debug("Ignore Fast Calibration\n");
+        return data->crosstalk;
+    }
 
-    mutex_lock(&data->lock);
+    pr_debug("START proximity sensor fast calibration\n");
+	/* Prevent Interrupt */
+	i2c_write_reg(client, REG_PS_TH, 0xFF);
+	i2c_write_reg(client, REG_PS_TL, 0x00);
+
+    i2c_read_reg(client, REG_CFG2, &cfg2data);
+    i2c_write_reg(client, REG_CFG2, cfg2data & 0x33); /*Offset mode & disable intr from ps*/
+
+    i2c_write_reg(client, REG_PS_OFFSET, 0x00); /*Set crosstalk = 0*/
+
     i2c_read_reg(client, REG_CFG0, &cfg0data);
-    i2c_read_reg(client, REG_CFG2, &cfg2data); /*Offset mode & disable intr from ps*/
-    i2c_read_reg(client, REG_CFG3, &cfg3data);
+    i2c_write_reg(client, REG_CFG0, cfg0data | 0x02); /*PS On*/
 
-    APS_LOG("cfg0 = %x\n cfg2 = %x\n cfg3 = %x\n",cfg0data, cfg2data, cfg3data);
+    for(i = 0; i < 4; i++){
+        mdelay(50);
+        i2c_read_reg(client,REG_PS_DATA,temp_pdata+i);
+        pr_debug("temp_data = %d\n", temp_pdata[i]);
+    }
 
-    i2c_write_reg(client, REG_CFG0, cfg0data | 1<<1);  /* PS Enable */
-    i2c_write_reg(client, REG_CFG2, cfg2data & 0x28); /*Offset mode & disable intr from ps*/
-    i2c_write_reg(client,REG_CFG3, cfg3data & 0xC7); /*Most short PS Sleep time 6.25 ms*/
-    i2c_write_reg(client, REG_PS_OFFSET, 0x00);//csl modify 20140107 //Set crosstalk = 0
-  msleep(20);
-  for(i = 0; i < ArySize; i++){
-        msleep(10);
-    i2c_read_reg(client,REG_PS_DATA,temp_pdata+i);
-        APS_LOG("temp_data = %d\n", temp_pdata[i]);
-  }
-  mutex_unlock(&data->lock);
     /* pdata sorting */
     for (i = 0; i < ArySize - 1; i++)
         for (j = i+1; j < ArySize; j++)
             if (temp_pdata[i] > temp_pdata[j])
                 pa12_swap(temp_pdata + i, temp_pdata + j);
+
     /* calculate the cross-talk using central 10 data */
-     for (i = 1; i < 3; i++) {
-        APS_LOG("%s: temp_pdata = %d\n", __func__, temp_pdata[i]);
+    for (i = 1; i < 3; i++) {
+        pr_debug("temp_pdata = %d\n", temp_pdata[i]);
         sum_of_pdata = sum_of_pdata + temp_pdata[i];
     }
-    xtalk_data= sum_of_pdata/2 + PA12_PS_OFFSET_EXTRA;
 
-    if((xtalk_data>=data->crosstalk) && (xtalk_data < (data->crosstalk + this_data->pdata->pa12_fast_cal_tolerance))){    //Max Value is 150,and must be grater than x-talk cal value
-        APS_LOG("%s: sum_of_pdata = %d   cross_talk = %d\n",
-                        __func__, sum_of_pdata, xtalk_data);
-        /*Write offset value to 0x10*/
-         mutex_lock(&data->lock);
-        i2c_write_reg(client, REG_PS_OFFSET,xtalk_data);
-         mutex_unlock(&data->lock);
-    }else{
-        APS_LOG("%s: invalid calibrated data\n", __func__);
-         mutex_lock(&data->lock);
-        i2c_write_reg(client, REG_PS_OFFSET,data->crosstalk);
-         mutex_unlock(&data->lock);
+    xtalk_temp = sum_of_pdata/2;
+	xtalk_temp += PA12_PS_OFFSET_EXTRA;
+    pr_debug("sum_of_pdata = %d   cross_talk = %d\n",
+             sum_of_pdata, data->crosstalk);
+
+    //Restore Data
+    i2c_write_reg(client, REG_CFG0, cfg0data);
+    i2c_write_reg(client, REG_CFG2, cfg2data | 0xC0); //make sure return normal mode
+
+    if ((sum_of_pdata<510-PA12_PS_OFFSET_EXTRA)&&(xtalk_temp < PA12_PS_OFFSET_MAX)
+		&& (data->crosstalk < xtalk_temp)) {
+        pr_debug("Fast calibrated data=%d\n",xtalk_temp);
+        bCal_flag = 1;
+        //Write offset value to 0x10
+        i2c_write_reg(client,REG_PS_OFFSET,xtalk_temp);
+    } else {
+        pr_debug("Fast calibration fail\n");
+        i2c_write_reg(client,REG_PS_OFFSET,data->crosstalk);
     }
+    pr_debug("FINISH PS calibration\n");
 
-    APS_LOG("%s: FINISH proximity sensor calibration\n", __func__);
-
-
-    /*Restore Original Status*/
-     mutex_lock(&data->lock);
-    i2c_write_reg(client,REG_CFG0,cfg0data); //restore CFG0 Initail status
-  i2c_write_reg(client,REG_CFG2,cfg2data | 0xC0); //restore CFG2 Initail status
-    i2c_write_reg(client,REG_CFG3,cfg3data); //restore CFG3 Initail status
-  mutex_unlock(&data->lock);
-    return xtalk_data;
+    return xtalk_temp;
 }
-#endif
+
+#ifdef USE_LIGHT_FEATURE
+void pa12200001_adjust_als_threshold(struct i2c_client *client,int count)
+{
+    int newTH,newTL;
+    u8 regdata=0;
+
+    newTH=count+PA12_ALS_TH_RANGE;
+    if(newTH>65535)
+        newTH=65535;
+
+    newTL=count-PA12_ALS_TH_RANGE;
+    if(newTL<0)
+        newTL=0;
+
+    /* Reset ALS Threshold */
+    i2c_write_reg(client,REG_ALS_TH_LSB,newTH & 0xFF); //set TH threshold
+    i2c_write_reg(client,REG_ALS_TH_MSB,(newTH >>8) & 0xFF); //set TH threshold
+    i2c_write_reg(client,REG_ALS_TL_LSB,newTL & 0xFF); //set TL threshold
+    i2c_write_reg(client,REG_ALS_TL_MSB,(newTL >>8) & 0xFF); //set TL threshold
+
+    i2c_read_reg(client, REG_CFG2, &regdata);
+    i2c_write_reg(client, REG_CFG2, regdata & 0xFC); // clear INT Flag
+    return ;
+}
 
 static int pa12200001_get_als_value(struct i2c_client *client)
 {
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    //u8 lsb, msb;
-    u8 lsb=0;//csl modify 20140107
-    u8 msb=0;//csl modify 20140107
-    int ret;
+    u8 lsb=0, msb=0;
+    int als_adc=0;
+    int i=0;
+    int sum=0;
 
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_ALS_DATA_LSB, &lsb);
-    ret = i2c_read_reg(client, REG_ALS_DATA_MSB, &msb);
-    mutex_unlock(&data->lock);
+    i2c_read_reg(client, REG_ALS_DATA_LSB, &lsb);
+    i2c_read_reg(client, REG_ALS_DATA_MSB, &msb);
+    als_adc=((msb << 8) | lsb);
+    //pr_debug("ALS ADC Count=%d\n",als_adc);
 
-    return ((msb << 8) | lsb);
+    if(ALS_AVG_ENABLE){ //AVG Function
+        if(ALSAVGStart){
+            ALSAVGStart=0;
+            ALSTempIndex=0;
+
+            for(i=0;i<10;i++)
+				ALSTemp[i]=als_adc;
+        } else {
+            if(ALSTempIndex<=9)
+                ALSTempIndex++;
+            else
+                ALSTempIndex=0;
+            ALSTemp[ALSTempIndex]=als_adc;
+
+            for(i=0;i<10;i++)
+                sum+=ALSTemp[i];
+
+            return (sum/10);
+        }
+    }
+    return als_adc;
 }
+
 static int pa12200001_get_lux_value(struct i2c_client *client)
 {
     int als_adc = pa12200001_get_als_value(client);
     int lux;
     int range = pa12200001_get_range(client);
 
-    lux = (als_adc * pa12200001_range[range]) >> 12;
+    if(!ALS_POLLING)
+        pa12200001_adjust_als_threshold(client,als_adc); //Dynamic Threshold
+
+    lux = (als_adc * pa12200001_range[range]) >> 10;
+	lux = lux * PA1220_PAELLA_CAL_MULT / PA1220_PAELLA_CAL_DIV; // Calibration for PAELLA
     return lux;
 }
-
-static int pa12200001_get_ps_value(struct i2c_client *client)
+#endif
+static u8 pa12200001_get_ps_value(struct i2c_client *client)
 {
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    u8  regdata;//csl modify 20140107
+    u8 data = 0;
+    i2c_read_reg(client, REG_PS_DATA, &data);
+    return data;
+}
+static int pa12200001_power_init(struct pa12200001_data *data, bool on)
+{
+    int rc;
+
+    if (!on)
+        goto pwr_deinit;
+
+    data->vdd = regulator_get(&data->client->dev, "vdd");
+    if (IS_ERR(data->vdd)) {
+        rc = PTR_ERR(data->vdd);
+        dev_err(&data->client->dev, "Regulator get failed vdd rc=%d\n", rc);
+        return rc;
+    }
+
+    if (regulator_count_voltages(data->vdd) > 0) {
+        rc = regulator_set_voltage(data->vdd, PAl2_VDD_MIN_UV,
+                PAl2_VDD_MAX_UV);
+        if (rc) {
+            dev_err(&data->client->dev, "Regulator set_vtg failed vdd rc=%d\n", rc);
+            goto reg_vdd_put;
+        }
+    }
+    return 0;
+
+reg_vdd_put:
+    regulator_put(data->vdd);
+    return rc;
+
+pwr_deinit:
+    if (regulator_count_voltages(data->vdd) > 0)
+        regulator_set_voltage(data->vdd, 0, PAl2_VDD_MAX_UV);
+    regulator_put(data->vdd);
+    return 0;
+}
+
+static int pa12200001_init_client(struct i2c_client *client)
+{
     int ret;
+    u8 int_set = 0;
 
-    mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_PS_DATA, &regdata);
-    mutex_unlock(&data->lock);
+    struct pa12200001_data *data = i2c_get_clientdata(client);
 
-    return regdata;
-    //return ret;//csl modify 20140107
+    pa12200001_power_init(data,true);
+
+    /* Initialize Sensor */
+    ret=i2c_write_reg(client,REG_CFG0,
+            (PA12_ALS_GAIN << 4));
+
+    ret=i2c_write_reg(client,REG_CFG1,
+            ((PA12_LED_CURR	<< 4)| (PA12_PS_PRST << 2)| (PA12_ALS_PRST)));
+
+    ret=i2c_write_reg(client,REG_CFG3,
+            ((PA12_INT_TYPE	<< 6)| (PA12_PS_PERIOD << 3)| (PA12_ALS_PERIOD)));
+
+    ret=i2c_write_reg(client,REG_PS_SET,0x03); //PSET
+
+#if 0
+    /* Check threshold calibration file */
+    if(pa12200001_read_file(THRD_CAL_FILE_PATH,buftemp)<0){
+        pr_debug("Use Default threhold , Low = %d , High = %d\n",PA12_PS_TH_LOW,PA12_PS_TH_HIGH);
+
+        buftemp[0]=data->ps_thrd_low=PA12_PS_TH_LOW;
+        buftemp[1]=data->ps_thrd_high=PA12_PS_TH_HIGH;
+        pa12200001_write_file(THRD_CAL_FILE_PATH,buftemp); //Create thrd_cal file
+
+    }else{
+        pr_debug("Use Threshold Cal file , Low = %d , High = %d\n",buftemp[0],buftemp[1]);
+        data->ps_thrd_low=buftemp[0];
+        data->ps_thrd_high=buftemp[1];
+    }
+#endif
+
+    data->ps_thrd_low = PA12_PS_TH_LOW;
+    data->ps_thrd_high = PA12_PS_TH_HIGH;
+
+    if(!PS_POLLING)
+    {
+        /* Set PS threshold */
+        i2c_write_reg(client,REG_PS_TH,data->ps_thrd_high); //set TH threshold
+        i2c_write_reg(client,REG_PS_TL,data->ps_thrd_low); //set TL threshold
+        int_set=1; //set PS INT
+    }
+
+#ifdef USE_LIGHT_FEATURE
+    if(!ALS_POLLING)
+    {
+        /* Set ALS threshold */
+        i2c_write_reg(client,REG_ALS_TH_LSB,PA12_ALS_TH_HIGH & 0xFF); //set TH threshold
+        i2c_write_reg(client,REG_ALS_TH_MSB,(PA12_ALS_TH_HIGH >>8) & 0xFF); //set TH threshold
+        i2c_write_reg(client,REG_ALS_TL_LSB,PA12_ALS_TH_LOW & 0xFF); //set TL threshold
+        i2c_write_reg(client,REG_ALS_TL_MSB,(PA12_ALS_TH_LOW >>8) & 0xFF); //set TL threshold
+        if(int_set)
+            int_set=3; // if PS INT enable set 3 (both enable)
+
+    }
+#endif
+
+    ret=i2c_write_reg(client,REG_CFG2,
+            ((PA12_PS_MODE	<< 6)|(int_set << 2)));
+    if(ret < 0) {
+        pr_err("i2c_send function err\n");
+        goto EXIT_ERR;
+    }
+
+    return 0;
+
+EXIT_ERR:
+    pr_err("pa12200001 init dev fail %d\n", ret);
+    return ret;
 }
 
 static int pa12200001_get_object(struct i2c_client *client)
 {
+    struct pa12200001_data *data = i2c_get_clientdata(client);
     u8 psdata = pa12200001_get_ps_value(client);
-    int ret;
-    if(ps_polling)
-    {
-        APS_LOG("PS:%d\n",psdata);
-        if(psdata < this_data->pdata->pa12_ps_th_low)
-            intr_flag = 5;
-        if(psdata > this_data->pdata->pa12_ps_th_high)
-            intr_flag = 3;
-    }else{
-        switch (this_data->pdata->pa12_int_type)
-        {
+    u8 regdata=0;
+
+    if (PS_POLLING) {
+        switch (intr_flag) {
+            case 0:
+                if(psdata < data->ps_thrd_low)
+                    intr_flag = 1;
+                break;
+            case 1:
+                if(psdata > data->ps_thrd_high)
+                    intr_flag = 0;
+                break;
+        }
+    } else {
+        switch (PA12_INT_TYPE) {
             case 0: /* Window Type */
-                if(intr_flag == 5){
-                    //if(psdata > PA12_PS_TH_FAR_HIGH)
-                  if(psdata > this_data->pdata->pa12_ps_th_high)
-                  {
-                        intr_flag = 3;
-                        //ret = pa12200001_set_plthres(client, REG_PS_TL, PA12_PS_TH_NEAR_LOW);
-                        //ret = pa12200001_set_phthres(client, REG_PS_TH, PA12_PS_TH_NEAR_HIGH);
-                        //ret = pa12200001_set_plthres(client, PA12_PS_TH_NEAR_LOW);//csl modify 20140107
-                        //ret = pa12200001_set_phthres(client, PA12_PS_TH_NEAR_HIGH);//csl modify 20140107
-                        ret = pa12200001_set_plthres(client, this_data->pdata->pa12_ps_th_max);
-                        ret = pa12200001_set_phthres(client, this_data->pdata->pa12_ps_th_low);
-                        ret = pa12200001_set_ps_prst(client,1);//Set PS PRST = 2 points
-                        APS_LOG("------near------ps = %d\n",psdata);
+                if(intr_flag == 1){
+                    if(psdata > data->ps_thrd_high){
+                        intr_flag = 0;
+                        i2c_write_reg(client,REG_PS_TL,data->ps_thrd_low);
+                        i2c_write_reg(client,REG_PS_TH, PA12_PS_TH_MAX);
                     }
-                }else if(intr_flag == 3){
-                    if(psdata < this_data->pdata->pa12_ps_th_low){
-                        intr_flag = 5;
-                        //ret = pa12200001_set_plthres(client, REG_PS_TL, PA12_PS_TH_FAR_LOW);
-                        //ret = pa12200001_set_phthres(client, REG_PS_TH, PA12_PS_TH_FAR_HIGH);
-                        //ret = pa12200001_set_plthres(client, PA12_PS_TH_FAR_LOW);
-                        //ret = pa12200001_set_phthres(client, PA12_PS_TH_FAR_HIGH);
-                        ret = pa12200001_set_plthres(client, this_data->pdata->pa12_ps_th_min);
-                        ret = pa12200001_set_phthres(client, this_data->pdata->pa12_ps_th_high);
-                        ret = pa12200001_set_ps_prst(client,this_data->pdata->pa12_ps_prst);
-                        APS_LOG("------far------ps = %d\n",psdata);
+                } else if(intr_flag == 0) {
+                    if (psdata < data->ps_thrd_low) {
+                        intr_flag = 1;
+                        i2c_write_reg(client,REG_PS_TL,PA12_PS_TH_MIN);
+                        i2c_write_reg(client,REG_PS_TH,data->ps_thrd_high);
                     }
                 }
-                pa12200001_clear_intr(client);
+                i2c_read_reg(client, REG_CFG2, &regdata);
+                i2c_write_reg(client, REG_CFG2, regdata & 0xFC); // clear PS INT Flag
                 break;
 
             case 1: /* Hysteresis Type */
-                if(psdata > this_data->pdata->pa12_ps_th_high){
-                    intr_flag = 3;
-                    pa12200001_set_ps_prst(client,1);//Set PS PRST = 2 points
-                    APS_LOG("-Hysteresis--near------ps = %d\n",psdata);
-                }else if(psdata < this_data->pdata->pa12_ps_th_low){
-                    intr_flag = 5;
-                    pa12200001_set_ps_prst(client,this_data->pdata->pa12_ps_prst);
-                    APS_LOG("-Hysteresis---far------ps = %d\n",psdata);
+                if(psdata > data->ps_thrd_high){
+					i2c_write_reg(client,REG_CFG1,
+						((PA12_LED_CURR	<< 4)| (1 << 2)| (PA12_ALS_PRST)));
+                    intr_flag = 0;
+                } else if (psdata < data->ps_thrd_low) {
+                    intr_flag = 1;
+					i2c_write_reg(client,REG_CFG1,
+						((PA12_LED_CURR	<< 4)| (PA12_PS_PRST << 2)| (PA12_ALS_PRST)));
                 }
-                /* No need to clear interrupt flag !! */
-                goto EXIT_GET_OBJ;
                 break;
         }
-
     }
+	pr_info("ps_thrd_low=%u, ps_thrd_high=%u, psdata=%u, report %s\n",
+			data->ps_thrd_low, data->ps_thrd_high, psdata, intr_flag ? "Far" : "Near");
 
-EXIT_GET_OBJ:
-    return intr_flag;
+    return intr_flag ? PA12_PS_FAR_DISTANCE : PA12_PS_NEAR_DISTANCE;
 }
-#if 0
+
 static int pa12200001_get_intstat(struct i2c_client *client)
 {
-//  struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    u8  regdata=0;
-
-//  mutex_lock(&data->lock);
-    ret = i2c_read_reg(client, REG_CFG2, &regdata);
-//  mutex_unlock(&data->lock);
-
-    regdata = regdata & 0x03;
-    return regdata;
-}
-#endif
-/*----------------------------------------------------------------------------*/
-/* Device Tree */
-//add by taokai 2014.7.31
-static int pa12200001_parse_configs(struct device *dev, char *name, u32 *array) {
-    int rc;
-    struct property *prop;
-    struct device_node *np = dev->of_node;
-
-    prop = of_find_property(np, name, NULL);
-    if (!prop)
-        return -EINVAL;
-    if (!prop->value)
-        return -ENODATA;
-
-    rc = of_property_read_u32_array(np, name, array, prop->length/sizeof(u32));
-    if (rc && (rc != -EINVAL)) {
-        dev_err(dev, "%s: Unable to read %s\n", __func__, name);
-        return rc;
-    }
-
-/*  dev_err(dev, "%s size is %d\n", name, prop->length/sizeof(u32));
-    for (i = 0; i < prop->length/sizeof(u32); i++) {
-        dev_info(dev, "arrary[%d]=%d, ", i, array[i]);
-    }
-    dev_info(dev, "\n");*/
-    return rc;
+    u8 data =0;
+    i2c_read_reg(client, REG_CFG2, &data);
+    return (data & 0x03);
 }
 
-static int pa12200001_parse_dt(struct device *dev, struct pa12200001_platform_data *pdata)
+/* X-talk Calibration file */
+static ssize_t pa12200001_show_calibration_file(struct device *pdev,
+        struct device_attribute *attr, char *buf)
 {
-    int rc = 0;
-    int index = 0;
-    u32 array[17];
-    struct device_node *np = dev->of_node;
+    u8 buftemp[2];
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
 
-    array[14] = PA12_FAST_PS_CAL;
-    array[15] = PA12_FAST_CAL_TOLERANCE;
-    array[16] = PA12_PS_OFFSET_MAX;
+    /* Check ps calibration file */
+    if (pa12200001_read_file(PS_CAL_FILE_PATH,buftemp) < 0){
+        pr_debug("Use Default ps offset , x-talk = %d\n",PA12_PS_OFFSET_DEFAULT);
 
-    pdata->gpio_int = of_get_named_gpio_flags(np, "pa12200001,gpio_int",
-        0, &pdata->irq_gpio_flags);
+        buftemp[1] = data->crosstalk_base=10;
+        buftemp[0] = data->crosstalk = PA12_PS_OFFSET_DEFAULT;
+        buftemp[0] = data->crosstalk - PA12_PS_OFFSET_EXTRA;
+        pa12200001_write_file(PS_CAL_FILE_PATH, buftemp); //Create x-tal_cal file
 
-    /* general_reg */
-    rc = pa12200001_parse_configs(dev, "pa12200001,cfgs", array);
-    if (rc) {
-        dev_err(dev, "Looking up %s property in node %s failed", "pa12200001,cfgs", np->full_name);
-        return -ENODEV;
+    } else {
+        pr_debug("Use PS Cal file , x-talk = %d base = %d\n",buftemp[0],buftemp[1]);
+        data->crosstalk=buftemp[0]+PA12_PS_OFFSET_EXTRA  ;
+        data->crosstalk_base=buftemp[1];
     }
 
-    pdata->pa12_ps_th_high                      = array[index++];
-    pdata->pa12_ps_th_low                       = array[index++];
-    pdata->pa12_ps_th_max                       = array[index++];
-    pdata->pa12_ps_th_min                       = array[index++];
-    pdata->pa12_ps_offset_default               = array[index++];
-    pdata->pa12_als_gain                        = array[index++];
-    pdata->pa12_led_curr                        = array[index++];
-    pdata->pa12_ps_prst                         = array[index++];
-    pdata->pa12_als_prst                        = array[index++];
-    pdata->pa12_int_set                         = array[index++];
-    pdata->pa12_ps_mode                         = array[index++];
-    pdata->pa12_int_type                        = array[index++];
-    pdata->pa12_ps_period                       = array[index++];
-    pdata->pa12_als_period                      = array[index++];
-    pdata->pa12_ps_fast_run_cal                 = array[index++];
-    pdata->pa12_fast_cal_tolerance              = array[index++];
-    pdata->pa12_ps_offset_max                   = array[index++];
+    i2c_write_reg(data->client,REG_PS_OFFSET,data->crosstalk); //X-talk Cancelling
 
-    printk("%s:pa12_ps_th_high=%d\n",__func__,pdata->pa12_ps_th_high);
-    printk("%s:pa12_ps_th_low=%d\n",__func__,pdata->pa12_ps_th_low);
-    printk("%s:pa12_ps_th_max=%d\n",__func__,pdata->pa12_ps_th_max);
-    printk("%s:pa12_ps_th_min=%d\n",__func__,pdata->pa12_ps_th_min);
-    printk("%s:pa12_ps_offset_default=%d\n",__func__,pdata->pa12_ps_offset_default);
-    printk("%s:pa12_als_gain=%d\n",__func__,pdata->pa12_als_gain);
-    printk("%s:pa12_led_curr=%d\n",__func__,pdata->pa12_led_curr);
-    printk("%s:pa12_ps_prst=%d\n",__func__,pdata->pa12_ps_prst);
-    printk("%s:pa12_als_prst=%d\n",__func__,pdata->pa12_als_prst);
-    printk("%s:pa12_int_set=%d\n",__func__,pdata->pa12_int_set);
-    printk("%s:pa12_ps_mode=%d\n",__func__,pdata->pa12_ps_mode);
-    printk("%s:pa12_int_type=%d\n",__func__,pdata->pa12_int_type);
-    printk("%s:pa12_ps_period=%d\n",__func__,pdata->pa12_ps_period);
-    printk("%s:pa12_als_period=%d\n",__func__,pdata->pa12_als_period);
-    printk("%s:pa12_ps_fast_run_cal=%d\n",__func__,pdata->pa12_ps_fast_run_cal);
-    printk("%s:pa12_fast_cal_tolerance=%d\n",__func__,pdata->pa12_fast_cal_tolerance);
-    printk("%s:pa12_ps_offset_max=%d\n",__func__,pdata->pa12_ps_offset_max);
-
-    return rc;
+    return sprintf(buf, "X-talk data= %d\n",buftemp[0]);
 }
-//add end
-/*----------------------------------------------------------------------------*/
-/* For HAL to Enable PS */
-static ssize_t pa12200001_show_enable_ps_sensor(struct device *dev,
-                struct device_attribute *attr, char *buf)
+static ssize_t pa12200001_store_calibration_file(struct device *dev,
+        struct device_attribute *attr, const char *buf, size_t count)
 {
-    struct i2c_client *client = to_i2c_client(dev);
-    return sprintf(buf, "%d\n", (PS_ACTIVE & pa12200001_get_mode(client))?1:0);
+    struct file  *fop;
+    mm_segment_t old_fs;
+    u8 tempbuf[2];
+    int temp;
+    sscanf(buf, "%d", &temp);
+    tempbuf[0]=(u8)temp;
+
+    fop = filp_open(PS_CAL_FILE_PATH,O_CREAT | O_RDWR,0644);
+    if(IS_ERR(fop)){
+        pr_err("open file %s failed !", PS_CAL_FILE_PATH);
+        return -1;
+    }
+
+    old_fs = get_fs();
+    set_fs(get_ds()); //set_fs(KERNEL_DS);
+    fop->f_op->write(fop, (char *)tempbuf, sizeof(tempbuf), &fop->f_pos);
+    set_fs(old_fs);
+
+    filp_close(fop,NULL);
+    return count;
 }
-static ssize_t pa12200001_store_enable_ps_sensor(struct device *dev,
-                struct device_attribute *attr, const char *buf, size_t count)
+static DEVICE_ATTR(xtalk_param, S_IWUGO | S_IRUGO,
+        pa12200001_show_calibration_file, pa12200001_store_calibration_file);
+
+/* Threshold Calibration file */
+static ssize_t pa12200001_show_pthrd_file(struct device *dev,
+        struct device_attribute *attr, char *buf)
 {
-    struct i2c_client *client = to_i2c_client(dev);
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    unsigned long val = simple_strtoul(buf, NULL, 10);
-    //unsigned long flags;
-    int mode=0;
+    u8 readtemp[2];
+    if (pa12200001_read_file(THRD_CAL_FILE_PATH,readtemp) < 0)
+        return sprintf(buf, "Open File Error\n");
 
-    printk("%s: enable ps sensor ( %ld)\n", __func__, val);
+    return sprintf(buf, "Low thrd = %d, High thrd = %d\n",readtemp[0],readtemp[1]);
+}
 
-    if ((val != 0) && (val != 1))//tag debug (chucuo)node ,1:enable,0:disable
-    {
-        printk("%s: enable ps sensor=%ld\n", __func__, val);
-        return count;
-    }
+static ssize_t pa12200001_store_pthrd_file(struct device *dev,
+        struct device_attribute *attr, const char *buf, size_t count)
+{
+    u8 buftemp[2];
+    int temp[2];
 
-    mode = pa12200001_get_mode(client);//PS and ALS is or not enable
-    if(val == 1) {
-        //turn on ps  sensor
-        mode |= PS_ACTIVE;
-        set_bit(PS_ACTIVE, &data->enable); //ps-active enable
+
+    if (2 != sscanf(buf, "%d %d", &temp[0], &temp[1])) {
+        pr_err("invalid format: '%s'\n", buf);
+        return -1;
     }
-    else {
-        mode &= ~PS_ACTIVE;
-        clear_bit(PS_ACTIVE, &data->enable);//ps-active disenable
-    }
-    pa12200001_set_mode(client, mode);
+    buftemp[0]=(u8)temp[0];
+    buftemp[1]=(u8)temp[1];
+
+    if(pa12200001_write_file(THRD_CAL_FILE_PATH,buftemp)<0)
+        pr_err("Create PS Thredhold calibration file error!!");
+    else
+        pr_debug("Create PS Thredhold calibration file Success!!");
 
     return count;
 }
-static DEVICE_ATTR(enable_ps_sensor, S_IWUSR | S_IRUGO,
-                   pa12200001_show_enable_ps_sensor, pa12200001_store_enable_ps_sensor);
-/* For HAL to Enable ALS */
-static ssize_t pa12200001_show_enable_als_sensor(struct device *dev,
-                struct device_attribute *attr, char *buf)
-{
-    struct i2c_client *client = to_i2c_client(dev);
-    return sprintf(buf, "%d\n", (ALS_ACTIVE & pa12200001_get_mode(client))?1:0);
 
+static int pa12200001_ps_set_enable(struct sensors_classdev *sensors_cdev,
+			      unsigned int enable)
+{
+	struct pa12200001_data *pa1 =
+	    container_of(sensors_cdev, struct pa12200001_data, ps_cdev);
+    int mode = 0;
+
+	if ((enable != 0) && (enable != 1)) {
+		pr_err("invalid argument %d\n", enable);
+		return -EINVAL;
+	}
+
+    mode = pa12200001_get_mode(pa1->client);
+    if(enable == 1) {
+        //turn on ps  sensor
+        int Pval;
+        mode |= PS_ACTIVE;
+        set_bit(PS_ACTIVE, &pa1->enable);
+		pa12200001_set_mode(pa1->client, mode);
+
+        Pval=pa12200001_get_object(pa1->client);
+        pr_debug("PS value: %d\n", Pval);
+
+        input_report_abs(pa1->proximity_input_dev, ABS_DISTANCE, Pval);
+        input_sync(pa1->proximity_input_dev);
+		pa1->ps_stat = Pval;
+		irq_set_irq_wake(pa1->irq, 1);
+		wake_lock(&pa1->ps_wakelock);
+		if (!pa1->irq_enabled) {
+			enable_irq(pa1->irq);
+			pa1->irq_enabled = 1;
+		}
+    } else {
+		if (pa1->irq_enabled) {
+			disable_irq(pa1->irq);
+			pa1->irq_enabled = 0;
+		}
+        mode &= ~PS_ACTIVE;
+		pa12200001_set_mode(pa1->client, mode);
+        clear_bit(PS_ACTIVE, &pa1->enable);
+		irq_set_irq_wake(pa1->irq, 0);
+		wake_unlock(&pa1->ps_wakelock);
+    }
+    pa1->ps_enable=((PS_ACTIVE & mode)>>1);
+    return 0;
 }
-static ssize_t pa12200001_store_enable_als_sensor(struct device *dev,
-                struct device_attribute *attr, const char *buf, size_t count)
-{
-    struct i2c_client *client = to_i2c_client(dev);
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    unsigned long val = simple_strtoul(buf, NULL, 10);
-    //unsigned long flags;
-    int mode=0;
 
-    printk("%s: enable als sensor ( %ld)\n", __func__, val);
+/*at least 500ms, "echo A > poll_delay" means poll A msec! */
+//static ssize_t pa12200001_ps_poll_delay(struct sensors_classdev *sensors_cdev,
+//				  unsigned int delay_msec)
+//{
+//	struct pa12200001_data *pa1 =
+//	    container_of(sensors_cdev, struct pa12200001_data, ps_cdev);
+
+//	if (delay_msec < PS_POLLING_RATE)	/* at least 100 ms */
+//		delay_msec = PS_POLLING_RATE;
+
+//    pa1->proximity_poll_delay = ns_to_ktime(delay_msec * NSEC_PER_MSEC);
+//    if (PS_POLLING)
+//    {
+            /* Enable/Disable PS */
+//            if (pa1->ps_enable)
+//            {
+//               hrtimer_start(&pa1->proximity_timer, pa1->proximity_poll_delay, HRTIMER_MODE_REL);
+//            }
+//    }
+//
+//	return 0;
+//}
+
+
+static DEVICE_ATTR(pthrd_param, S_IWUGO | S_IRUGO,
+        pa12200001_show_pthrd_file, pa12200001_store_pthrd_file);
+
+static ssize_t pa12200001_show_enable_ps_sensor(struct device *pdev,
+        struct device_attribute *attr, char *buf)
+{
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+    return sprintf(buf, "%d\n", (PS_ACTIVE & pa12200001_get_mode(data->client))?1:0);
+}
+static ssize_t pa12200001_store_enable_ps_sensor(struct device *pdev,
+        struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+    unsigned long val = simple_strtoul(buf, NULL, 10);
+
+    if ((val != 0) && (val != 1)) {
+        pr_err("invalid argument %ld\n", val);
+        return count;
+    }
+	pr_info("enable = %ld\n", val);
+
+	pa12200001_ps_set_enable(&data->ps_cdev, (unsigned int)val);
+
+    return count;
+}
+static DEVICE_ATTR(ps_enable, S_IWUGO | S_IRUGO,
+        pa12200001_show_enable_ps_sensor, pa12200001_store_enable_ps_sensor);
+
+#ifdef USE_LIGHT_FEATURE
+static ssize_t pa12200001_show_enable_als_sensor(struct device *pdev,
+        struct device_attribute *attr, char *buf)
+{
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+
+    return sprintf(buf, "%d\n", (ALS_ACTIVE & pa12200001_get_mode(data->client))?1:0);
+}
+static ssize_t pa12200001_store_enable_als_sensor(struct device *pdev,
+        struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+
+    unsigned long val = simple_strtoul(buf, NULL, 10);
+    int mode=0;
 
     if ((val != 0) && (val != 1))
     {
-        printk("%s: enable als sensor=%ld\n", __func__, val);
+        pr_err("invalid argument %ld\n", val);
         return count;
     }
+	pr_info("enable = %ld\n", val);
 
-    mode = pa12200001_get_mode(client);
-    if(val == 1)
-  {
+    mode = pa12200001_get_mode(data->client);
+    if (val == 1) {
         //turn on light  sensor
+        if (data->pre_lux == 0){
+            // in total darkness, force a first report
+            input_report_abs(data->light_input_dev, ABS_LIGHT, 1);
+            input_sync(data->light_input_dev);
+            data->pre_lux = 1;
+        }
         mode |= ALS_ACTIVE;
         set_bit(ALS_ACTIVE,&data->enable);
-    }
-    else {
+    } else {
         mode &= ~ALS_ACTIVE;
         clear_bit(ALS_ACTIVE, &data->enable);
     }
-    pa12200001_set_mode(client, mode);
+    pa12200001_set_mode(data->client, mode);
 
     return count;
 }
-static DEVICE_ATTR(enable_als_sensor, S_IWUSR | S_IRUGO,
-                   pa12200001_show_enable_als_sensor, pa12200001_store_enable_als_sensor);
-/* For HAL */
+static DEVICE_ATTR(als_enable, S_IWUGO | S_IRUGO,
+        pa12200001_show_enable_als_sensor, pa12200001_store_enable_als_sensor);
+
 static ssize_t pa12200001_show_als_poll_delay(struct device *dev,
-                struct device_attribute *attr, char *buf)
+        struct device_attribute *attr, char *buf)
 {
-//  struct i2c_client *client = to_i2c_client(dev);
-//  struct LSC_data *data = i2c_get_clientdata(client);
-/*pls finish by yourself*/
-    return sprintf(buf, "%d\n", 0); // return in micro-second
+    return sprintf(buf, "%d\n", 0);	// return in micro-second
 }
 
 static ssize_t pa12200001_store_als_poll_delay(struct device *dev,
-                    struct device_attribute *attr, const char *buf, size_t count)
+        struct device_attribute *attr, const char *buf, size_t count)
 {
-    //struct i2c_client *client = to_i2c_client(dev);
-    //struct LSC_data *data = i2c_get_clientdata(client);
     unsigned long val = simple_strtoul(buf, NULL, 10);
-    //int ret;
-    //int poll_delay=0;
-    //unsigned long flags;
 
-    if (val<5000)
-        val = 5000; // minimum 5ms
+    if (val < 5000)
+        val = 5000;	// minimum 5ms
 
-/*pls finish by yourself*/
     //data->light_poll_delay=ns_to_ktime(val * NSEC_PER_MSEC);
-
     return count;
 }
 
 static DEVICE_ATTR(als_poll_delay, S_IWUSR | S_IRUGO,
-                   pa12200001_show_als_poll_delay, pa12200001_store_als_poll_delay);
-/* PS Value */
-static ssize_t pa12200001_show_ps(struct device *dev,
-                struct device_attribute *attr, char *buf)
-{
-    struct i2c_client *client = to_i2c_client(dev);
-    struct pa12200001_data *data = i2c_get_clientdata(client);
+        pa12200001_show_als_poll_delay, pa12200001_store_als_poll_delay);
+#endif
 
-    return sprintf(buf, "PS = %d\n", pa12200001_get_ps_value(data->client));
-}
-static DEVICE_ATTR(ps, S_IRUGO,
-                   pa12200001_show_ps, NULL);
-/* ALS Value */
-static ssize_t pa12200001_show_als(struct device *dev,
-                struct device_attribute *attr, char *buf)
+static ssize_t pa12200001_show_ps(struct device *pdev,
+        struct device_attribute *attr, char *buf)
 {
-    struct i2c_client *client = to_i2c_client(dev);
-    //struct pa12200001_data *data = i2c_get_clientdata(client);//csl modify 20140107
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
 
-    return sprintf(buf, "als = %d\n", pa12200001_get_als_value(client));
+    return sprintf(buf, "%d\n", pa12200001_get_ps_value(data->client));
 }
-static DEVICE_ATTR(als, S_IRUGO,
-                   pa12200001_show_als, NULL);
-/* Write/Read Register data */
-static ssize_t pa12200001_show_reg(struct device *dev,
-                struct device_attribute *attr, char *buf)
+static DEVICE_ATTR(ps, S_IRUGO, pa12200001_show_ps, NULL);
+
+#ifdef USE_LIGHT_FEATURE
+static ssize_t pa12200001_show_als(struct device *pdev,
+        struct device_attribute *attr, char *buf)
 {
-    struct i2c_client *client = to_i2c_client(dev);
-    struct pa12200001_data *data = i2c_get_clientdata(client);
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+
+    return sprintf(buf, "%d\n", pa12200001_get_als_value(data->client));
+}
+static DEVICE_ATTR(als, S_IRUGO, pa12200001_show_als, NULL);
+#endif
+
+static ssize_t pa12200001_show_reg(struct device *pdev,
+        struct device_attribute *attr, char *buf)
+{
     int ret;
     int i = 0;
     int count = 0;
-    u8  regdata=0;
+    u8 regdata = 0;
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
 
-    mutex_lock(&data->lock);
-    for(i=0;i <18 ;i++)
-    {
-        ret = i2c_read_reg(client, 0x00+i, &regdata);
-
-        if(ret<0)
-        {
-           break;
-        }
+    for (i = 0; i < 17; i++) {
+        ret = i2c_read_reg(data->client, 0x00+i, &regdata);
+        if (ret < 0)
+            break;
         else
-        count += sprintf(buf+count,"[%x] = (%x)\n",0x00+i,regdata);
+            count += sprintf(buf+count,"[%x]: %x\n", 0x00+i, regdata);
     }
-    mutex_unlock(&data->lock);
-
     return count;
 }
-static ssize_t pa12200001_store_reg(struct device *dev,
-                struct device_attribute *attr, const char *buf, size_t count)
+static ssize_t pa12200001_store_reg(struct device *pdev,
+        struct device_attribute *attr, const char *buf, size_t count)
 {
-    struct i2c_client *client = to_i2c_client(dev);
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int addr, cmd;
-    int ret;//csl modify 20140107
+    int addr, cmd, ret;
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
 
-    if(2 != sscanf(buf, "%x %x", &addr, &cmd))//2 means two parametre
-    {
-        APS_ERR("invalid format: '%s'\n", buf);
-        return 0;
+    if(2 != sscanf(buf, "%x %x", &addr, &cmd)) {
+        pr_err("invalid format: '%s'\n", buf);
+        return count;
     }
 
-    mutex_lock(&data->lock);
-    ret = i2c_write_reg(client, addr, cmd);
-    mutex_unlock(&data->lock);
-
+    ret = i2c_write_reg(data->client, addr, cmd);
     return count;
 }
-static DEVICE_ATTR(reg, S_IWUSR | S_IRUGO,
-                   pa12200001_show_reg, pa12200001_store_reg);
+static DEVICE_ATTR(reg, S_IWUGO | S_IRUGO, pa12200001_show_reg, pa12200001_store_reg);
+
 /* PS Calibration */
-static ssize_t pa12200001_store_ps_calibration(struct device *dev,
-                struct device_attribute *attr, const char *buf, size_t count)//csl modify 20140107
+static ssize_t pa12200001_store_ps_calibration(struct device *pdev,
+        struct device_attribute *attr, const char *buf, size_t count)
 {
-    struct i2c_client *client = to_i2c_client(dev);//csl modify 20140107
-    int xtalk;
-    u8 prox_param[4];
+	int ret;
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+	unsigned long val = simple_strtoul(buf, NULL, 10);
 
-    xtalk = pa12200001_run_calibration(client);
-    prox_param[0] = xtalk;
-    prox_param[1] = this_data->pdata->pa12_ps_th_high;
-    prox_param[2] = this_data->pdata->pa12_ps_th_low;
-    prox_param[3] = this_data->crosstalk;
-    sensparams_write_to_flash(SENSPARAMS_TYPE_PROX, prox_param, 4);
-    return xtalk;
+	if (val != 1) {
+		pr_err("invalid argument %lu\n", val);
+		return -EINVAL;
+	}
+
+    ret = pa12200001_run_calibration(data->client);
+	if (ret < 0)
+		return ret;
+
+	pr_debug("ret = %d, count = %d\n", ret, count);
+    return count;
 }
-static ssize_t pa12200001_show_ps_calibration(struct device *dev,
-                struct device_attribute *attr, char *buf)//csl modify 20140107
+static ssize_t pa12200001_show_ps_calibration(struct device *pdev,
+        struct device_attribute *attr, char *buf)
 {
-    struct i2c_client *client = to_i2c_client(dev);//csl modify 20140107
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+    if(data->cal_result<0)
+        return sprintf(buf, "%d\n",-1);
 
-    u8 regdata;
+    return sprintf(buf, "%d\n", pa12200001_get_pscrosstalk(data->client));
 
-    regdata = pa12200001_get_pscrosstalk(client);
-    //return=sprintf(buf, "PS Crosstalk = %u\n", regdata);
-    return sprintf(buf, "PS Crosstalk = %d\n", regdata);//csl modify 20140107
 }
-static DEVICE_ATTR(ps_calibration, S_IWUSR | S_IRUGO,
-                   pa12200001_show_ps_calibration, pa12200001_store_ps_calibration);
+static DEVICE_ATTR(pscalibration, S_IWUGO | S_IRUGO | S_IXUGO,
+        pa12200001_show_ps_calibration, pa12200001_store_ps_calibration);
 
-static ssize_t pa12200001_show_flash(struct device *dev,
-                struct device_attribute *attr, char *buf)
+/* PS Threshold Calibration */
+static ssize_t pa12200001_store_pthreshold_calibration(struct device *pdev,
+        struct device_attribute *attr, const char *buf, size_t count)
 {
-    u8  prox_param[4];
-    sensparams_read_from_flash(SENSPARAMS_TYPE_PROX,prox_param, 4);//
-    return sprintf(buf, "Status = %d,TH High = %d,TH Low = %d,X-talk =%d\n", prox_param[0],prox_param[1],prox_param[2],prox_param[3]);
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+    pa12200001_thrd_calibration(data->client);
+    return count;
 }
-static DEVICE_ATTR(readflash, S_IRUGO,
-                   pa12200001_show_flash, NULL); //para 1:node name,/para 2:permission 3:permission function of read 4:permission function of write
-
-static void pa12200001_report_prox_event(struct pa12200001_data *data, int value)
+static ssize_t pa12200001_show_pthreshold_calibration(struct device *pdev,
+        struct device_attribute *attr, char *buf)
 {
-	ktime_t timestamp = ktime_get_boottime();
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
 
-	input_event(data->proximity_input_dev, EV_SYN, SYN_TIME_SEC,
-		ktime_to_timespec(timestamp).tv_sec);
-	input_event(data->proximity_input_dev, EV_SYN, SYN_TIME_NSEC,
-		ktime_to_timespec(timestamp).tv_nsec);
-	input_event(data->proximity_input_dev, EV_MSC, MSC_SCAN, value);
-	input_sync(data->proximity_input_dev);
+    return sprintf(buf, "Low threshold = %d , High threshold = %d\n",
+		data->ps_thrd_low,data->ps_thrd_high);
+
 }
+static DEVICE_ATTR(pthredcalibration, S_IWUGO | S_IRUGO,
+        pa12200001_show_pthreshold_calibration, pa12200001_store_pthreshold_calibration);
 
-static void pa12200001_report_light_event(struct pa12200001_data *data, int value)
+static ssize_t pa12200001_store_dev_init(struct device *pdev,
+        struct device_attribute *attr, const char *buf, size_t count)
 {
-	ktime_t timestamp = ktime_get_boottime();
-
-	input_event(data->light_input_dev, EV_SYN, SYN_TIME_SEC,
-		ktime_to_timespec(timestamp).tv_sec);
-	input_event(data->light_input_dev, EV_SYN, SYN_TIME_NSEC,
-		ktime_to_timespec(timestamp).tv_nsec);
-	input_event(data->light_input_dev, EV_MSC, MSC_SCAN, value);
-	input_sync(data->proximity_input_dev);
+	struct input_dev *input_dev = container_of(pdev, struct input_dev, dev);
+	struct pa12200001_data *data = input_get_drvdata(input_dev);
+    int ret;
+    ret = pa12200001_init_client(data->client);
+    return count;
 }
+static DEVICE_ATTR(dev_init, S_IWUGO | S_IRUGO, NULL, pa12200001_store_dev_init);
 
-/*work que function*/
 static void pa12200001_work_func_proximity(struct work_struct *work)
 {
     struct pa12200001_data *data = container_of(work,
-                        struct pa12200001_data, work_proximity);
-    int Pval;
+            struct pa12200001_data, work_proximity);
+    int pval;
 
-    Pval=pa12200001_get_object(data->client);
+    pval = pa12200001_get_object(data->client);
+	if (pval == data->ps_stat) {
+		pr_info("ignore repeated event\n");
+		return;
+	}
 
-    APS_LOG("PS value: %d\n", Pval);
+	data->ps_stat = pval;
 
-    pa12200001_report_prox_event(data, Pval);
+    input_report_abs(data->proximity_input_dev, ABS_DISTANCE, pval);
+    input_sync(data->proximity_input_dev);
 
+#ifdef USE_LIGHT_FEATURE
+    if(ALS_POLLING & data->als_enable) //reschudule ALS polling work
+    {
+    }
+#endif
 }
+
+#ifdef USE_LIGHT_FEATURE
 static void pa12200001_work_func_light(struct work_struct *work)
 {
     struct pa12200001_data *data = container_of(work, struct pa12200001_data, work_light);
-    int Aval;
+    int aval;
 
-    Aval = pa12200001_get_lux_value(data->client);
-    APS_DBG("ALS lux value: %d\n", Aval);
+    aval = pa12200001_get_lux_value(data->client);
 
-    pa12200001_report_light_event(data, Aval);
+	if (data->pre_lux == aval)
+		return;
+    //pr_debug("aval = %d\n", aval);
+
+    input_report_abs(data->light_input_dev, ABS_LIGHT, aval);
+    input_sync(data->light_input_dev);
+
+	data->pre_lux = aval;
+
+    if(PS_POLLING & data->ps_enable) //reschudule PS polling work
+    {
+    }
+}
+#endif
+
+static void pa12200001_work_func_irq(struct work_struct *work)
+{
+    struct pa12200001_data *data = container_of(work, struct pa12200001_data, work_irq);
+    u8 int_status;
+
+    int_status = pa12200001_get_intstat(data->client);  //Get INT Status and
+    pr_debug("IRQ Work INT status: %d\n", int_status);
+
+#ifdef USE_LIGHT_FEATURE
+    // Read ALS and Report
+    if ((int_status & ALS_INT_ACTIVE) && !ALS_POLLING) {
+        queue_work(data->wq, &data->work_light);
+    }
+#endif
+    // Read PS and Report
+    if (!PS_POLLING) {
+        queue_work(data->wq, &data->work_proximity);
+    }
 }
 
 /* assume this is ISR */
 static irqreturn_t pa12200001_irq(int irq, void *info)
 {
-
     struct i2c_client *client=(struct i2c_client *)info;
     struct pa12200001_data *data = i2c_get_clientdata(client);
-
-#if 0
-    u8 int_stat;
-    int_stat = pa12200001_get_intstat(data->client);
-    printk(KERN_INFO"pa12200001:%s:int_stat=%d\n",__func__,int_stat);
-    /* ALS int */
-    if ((int_stat & ALS_INT_ACTIVE) && !als_polling)
-    {
-        queue_work(data->wq, &data->work_light);
-    }
-    /* PS int */
-    if ((int_stat & PS_INT_ACTIVE) && !ps_polling)
-    {
-        queue_work(data->wq, &data->work_proximity);
-    }
-#endif
-    printk(KERN_INFO"pa12200001:%s :irq handle\n",__func__);
-    queue_work(data->wq, &data->work_proximity);
-
+    schedule_work(&data->work_irq); //pa12200001_work_func_irq()
     return IRQ_HANDLED;
 }
 
+#ifdef USE_LIGHT_FEATURE
 /*assume this is timer*/
 static enum hrtimer_restart pa12200001_light_timer_func(struct hrtimer *timer)
 {
@@ -1234,9 +1377,9 @@ static enum hrtimer_restart pa12200001_light_timer_func(struct hrtimer *timer)
 
     queue_work(data->wq, &data->work_light);
     hrtimer_forward_now(&data->light_timer, data->light_poll_delay);
-
     return HRTIMER_RESTART;
 }
+#endif
 
 static enum hrtimer_restart pa12200001_pxy_timer_func(struct hrtimer *timer)
 {
@@ -1244,336 +1387,87 @@ static enum hrtimer_restart pa12200001_pxy_timer_func(struct hrtimer *timer)
 
     queue_work(data->wq, &data->work_proximity);
     hrtimer_forward_now(&data->proximity_timer, data->proximity_poll_delay);
-
     return HRTIMER_RESTART;
 }
-
-//static void pa12200001_timer_init(struct LSC_data *data)
-static void pa12200001_timer_init(struct pa12200001_data *data)//csl modify 20140107
+static int sensor_parse_dt(struct device *dev, struct pa12200001_data *data)
 {
-    if (ps_polling)
-    {
-        /* proximity hrtimer settings. */
+    struct device_node *np = dev->of_node;
+    struct i2c_client *client;
+    unsigned int tmp;
+    int rc = 0;
+
+    client = data->client;
+    data->irq_gpio = of_get_named_gpio_flags(np, "pa12200001,irq-gpio",
+            0, &data->irq_gpio_flags);
+    if (data->irq_gpio < 0) {
+        pr_err("invalid irq gpio\n");
+        return -EINVAL;
+    }
+
+    rc = of_property_read_u32(np, "pa12200001,prox_th_min", &tmp);
+    if (rc) {
+        dev_err(dev, "Unable to read prox_th_min\n");
+        return rc;
+    }
+    data->ps_thrd_low = tmp;
+
+    rc = of_property_read_u32(np, "pa12200001,prox_th_max", &tmp);
+    if (rc) {
+        dev_err(dev, "Unable to read prox_th_max\n");
+        return rc;
+    }
+    data->ps_thrd_high = tmp;
+
+    return 0;
+}
+static void pa12200001_timer_init(struct pa12200001_data *data)
+{
+    if (PS_POLLING) {
         hrtimer_init(&data->proximity_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-        data->proximity_poll_delay = ns_to_ktime(500 * NSEC_PER_MSEC);
+        data->proximity_poll_delay = ns_to_ktime(100 * NSEC_PER_MSEC);
         data->proximity_timer.function = pa12200001_pxy_timer_func;
     }
 
-    if (als_polling)
-    {
-        /* light hrtimer settings. */
+#ifdef USE_LIGHT_FEATURE
+    if (ALS_POLLING) {
         hrtimer_init(&data->light_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-        data->light_poll_delay = ns_to_ktime(300 * NSEC_PER_MSEC);
+        data->light_poll_delay = ns_to_ktime(100 * NSEC_PER_MSEC);
         data->light_timer.function = pa12200001_light_timer_func;
     }
+#endif
 }
-/*--------------*///device node
 
-static struct attribute *pa12200001_attributes[] = {
-    &dev_attr_enable_ps_sensor.attr,
-    &dev_attr_enable_als_sensor.attr,
+static struct attribute *pa12200001_als_attributes[] = {
+#ifdef USE_LIGHT_FEATURE
+    &dev_attr_als_enable.attr,
     &dev_attr_als_poll_delay.attr,
     &dev_attr_als.attr,
-    &dev_attr_ps.attr,
+#endif
     &dev_attr_reg.attr,
-    &dev_attr_ps_calibration.attr,
-    &dev_attr_readflash.attr,
+    &dev_attr_dev_init.attr,
     NULL
 };
-
-static const struct attribute_group pa12200001_attr_group = {
-    .attrs = pa12200001_attributes,
+static const struct attribute_group pa12200001_als_attr_group = {
+    .attrs = pa12200001_als_attributes,
 };
 
-/*
- * Initialization function
- */
-
-static int pa12200001_init_client(struct i2c_client *client)
-{
-    struct pa12200001_data *data = i2c_get_clientdata(client);
-    int ret;
-    /* Initialize Sensor */
-    mutex_lock(&data->lock);
-    ret=i2c_write_reg(client,REG_CFG0,
-        (data->pdata->pa12_als_gain << 4));//ALS Gain
-
-    ret=i2c_write_reg(client,REG_CFG1,
-        ((data->pdata->pa12_led_curr    << 4)| (data->pdata->pa12_ps_prst << 2)| (data->pdata->pa12_als_prst)));// LED Current,PS PRST,ALS PRST
-
-    ret=i2c_write_reg(client,REG_CFG2,
-        ((data->pdata->pa12_ps_mode << 6)| (data->pdata->pa12_int_set << 2)));//Noram mode,PS/ALS Interrput enable
-
-    ret=i2c_write_reg(client,REG_CFG3,
-        ((data->pdata->pa12_int_type    << 6)| (data->pdata->pa12_ps_period << 3)| (data->pdata->pa12_als_period)));//Interrupt Type,PS sleep time,ALS sleep time
-
-    ret=i2c_write_reg(client,REG_PS_SET,0x03); //PS set should be 0x03
-
-    ret=i2c_write_reg(client,REG_PS_OFFSET, data->pdata->pa12_ps_offset_default); //x-talk offset
-
-    if(!ps_polling)
-    {
-        /* Set PS threshold */
-            ret=i2c_write_reg(client,REG_PS_TH,data->pdata->pa12_ps_th_high); //set TH threshold
-            ret=i2c_write_reg(client,REG_PS_TL,data->pdata->pa12_ps_th_low); //set TL threshold
-    }
-    mutex_unlock(&data->lock);
-
-    if(ret < 0)
-    {
-        APS_ERR("i2c_send function err\n");
-        goto EXIT_ERR;
-    }
-
-    return 0;
-
-    EXIT_ERR:
-    APS_ERR("pa12200001 init dev fail!!!!: %d\n", ret);
-    return ret;
-}
-
-static int pa12200001_suspend(struct i2c_client *client, pm_message_t mesg)
-{
-    APS_LOG("pa12200001 suspend");
-    if(light_active)//ALS ON
-    {
-    APS_LOG("Disalbe ALS for suspend");
-    pa12200001_als_enable(0);
-    }
-    if(prox_active)//PS ON
-    {
-    APS_LOG("Keep PS awake for suspend");
-    #if 0 // yinchao delete wake_lock @20140901
-    wake_lock(&this_data->prx_wake_lock);//Keep system awake if PS is enable
-    #endif
-    }
-   APS_LOG("pa12200001 suspend end");
-    #if 0  //some problem in following code , maybe crash the system
-    struct pa12200001_data *data = container_of(h, struct pa12200001_data, early_suspend);
-
-    APS_LOG("%s line %d \r\n",__func__,__LINE__);
-
-
-   suspend_mode = pa12200001_get_mode(data->client);
-
-    if(test_bit(ALS_ACTIVE, &data->enable))
-        pa12200001_set_mode(data->client, (suspend_mode & ~ALS_ACTIVE));
-
-    if (suspend_mode & PS_ACTIVE)
-    {
-        APS_LOG("suspend_mode=%d\r\n",suspend_mode);
-        if (!ps_polling) {
-        enable_irq_wake(data->pdata->irq);
-        }
-        wake_lock(&data->prx_wake_lock);
-    }
-    #endif
-    return 0;
-}
-
-static int pa12200001_resume(struct i2c_client *client)
-{
-    APS_LOG("pa12200001 resume");
-    if(light_active)//ALS ON
-    {
-    APS_LOG("Enable ALS for resume");
-    pa12200001_als_enable(1);
-    }
-    if(prox_active)//PS ON
-    {
-    APS_LOG(" Wake_Unlock PS for Resume");
-    #if 0 // yinchao delete wake_lock @20140901
-    wake_unlock(&this_data->prx_wake_lock);//Unlock wake lock, force not to sleep
-    #endif
-    }
-    #if 0 //some problem in following code , maybe crash the system
-    //struct pa12200001_data *data = container_of(h, struct LSC_data, early_suspend);
-    struct pa12200001_data *data = container_of(h, struct pa12200001_data, early_suspend);//csl modify 20140107
-
-    if (suspend_mode & PS_ACTIVE)
-    {
-        APS_LOG("suspend_mode=%d\r\n",suspend_mode);
-        if (!ps_polling) {
-            disable_irq_wake(data->pdata->irq);
-        }
-        wake_unlock(&data->prx_wake_lock);
-    }
-
-    if(test_bit(ALS_ACTIVE,&data->enable))
-    {
-        pa12200001_set_mode(data->client, ((test_bit(PS_ACTIVE,&data->enable))?(suspend_mode | ALS_ACTIVE)|PS_ACTIVE:(suspend_mode | ALS_ACTIVE)&~PS_ACTIVE));
-    }
-    #endif
-    return 0;
-}
-
-
-static long pa12200001_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-
-//  int init_ps_gain = 0;
-    int ret = 0;
-    int xtalk=0;
-    int i=0;
-    u8  prox_param[4];
-    u8 first_open_prox = 1;
-     switch (cmd) {
-        case PA12_IOCTL_ALS_ON:
-            pa12200001_als_enable(1);
-            light_active = 1;
-            APS_LOG("[pa12]:>>>>%s: enable pa12_als light \n", __func__);
-       break;
-        case PA12_IOCTL_ALS_OFF:
-            pa12200001_als_enable(0);
-            light_active = 0;
-  /*
-            if(0 ==  prox_active) { //add by binz
-                    //need ALS ON
-
-                light_active = 0;
-                //cancel_work_sync(&irq_workqueue);//add by binz
-                APS_LOG("[pa12]:>>>>%s:  disable pa12_als light & prox  \n", __func__);
-            }else{
-                APS_LOG("[pa12]:>>>>%s: PA12_IOCTL_ALS_OFF: The pa12200001_ps is on ! \n", __func__);
-                }
-    */
-            break;
-
-        case PA12_IOCTL_PROX_ON:
-            if(this_data->pdata->pa12_ps_fast_run_cal)
-               pa12200001_fast_run_calibration(this_data->client);
-
-
-
-
-            pa12200001_ps_enable(1);
-            printk("zb test :enter PA12_IOCTL_PROX_ON %d at %d\n",PA12_FAST_PS_CAL,__LINE__);
-
-            msleep(60);
-
-            {
-                int val = 0;
-                val = pa12200001_get_object(this_data->client);
-
-                printk("-!!!!-chenyz!!!!:val=%d,first_open_prox=%d,temp_flag=%d\n",val,first_open_prox,temp_flag);
-
-                if(((1 == temp_flag)&&(1 == first_open_prox))||((temp_flag != 1)&&(temp_flag == val)))//temp is not exit the first time
-                {
-                    if(temp_flag != 3){     //judge the state of proximity sensor is far
-                        pa12200001_report_prox_event(this_data, val);
-                    }
-                }
-
-            }
-
-
-
-#if 0  //chenyunzhe remove this codes below for no need to force PS report system  status becase of MISC_SCAN
-            if(!ps_polling)//force trigger once
-            {
-                intr_flag = 0;
-                APS_LOG("ioctr ---intr_flag--- = %d\n",intr_flag);
-                queue_work(this_data->wq, &this_data->work_proximity);
-            }
-#endif
-
-
-
-            enable_irq(this_data->als_ps_int);
-            prox_active = 1;
-
-
-
-            // yinchao add irq_wake @20140901
-            ret = irq_set_irq_wake(this_data->als_ps_int, 1);
-            if (ret)
-            {
-                printk(KERN_ERR "irq_set_irq_wake(on) fail\n");
-
-                return ret;
-            }
-            APS_LOG("[pa12]:>>>>%s: enable pa12_als proximity end\n", __func__);
-            break;
-
-        case PA12_IOCTL_PROX_OFF:
-            // yinchao add irq_wake @20140901
-            ret = irq_set_irq_wake(this_data->als_ps_int, 0);
-            if (ret)
-            {
-                printk(KERN_ERR "irq_set_irq_wake(off) fail\n");
-
-                return ret;
-            }
-            pa12200001_ps_enable(0);
-            first_open_prox = 0;
-            temp_flag = intr_flag;
-            disable_irq_nosync(this_data->als_ps_int);
-            prox_active = 0;
-
-            break;
-
-        case PA12_IOCTL_PROX_CALIBRATE:
-
-            APS_LOG("Run PS Calibration !\n");
-            //pa12200001_als_enable(0); //release timer before calibration
-            xtalk=pa12200001_run_calibration(this_data->client);//Run PS Calibration
-            //if(prox_active)
-            //pa12200001_ps_enable(1);
-
-        cal_tmp[0] = xtalk;
-            cal_tmp[1] = (unsigned short) this_data->pdata->pa12_ps_th_high;
-            cal_tmp[2] = (unsigned short) this_data->pdata->pa12_ps_th_low;
-            cal_tmp[3] = (unsigned short) this_data->crosstalk;
-            for(i=0 ; i < 4 ; i++)
-            {prox_param[i]=(u8) cal_tmp[i];}
-
-            if(cal_tmp[0] == 1){
-            sensparams_write_to_flash(SENSPARAMS_TYPE_PROX, prox_param, 4);
-            }else{
-            sensparams_write_to_flash(SENSPARAMS_TYPE_PROX, prox_param, 1);
-            }
-            if (copy_to_user((unsigned short*)arg, cal_tmp, sizeof(cal_tmp)))
-                return -EFAULT;
-            break;
-
-        case PA12_IOCTL_PROX_OFFSET:
-            APS_LOG("Read PROX_PRAMS from flash  !\n");
-            sensparams_read_from_flash(SENSPARAMS_TYPE_PROX,prox_param, 4);
-            mutex_lock(&this_data->lock);
-            this_data->crosstalk=prox_param[3];
-            i2c_write_reg(this_data->client, REG_PS_OFFSET,prox_param[3]);
-      mutex_unlock(&this_data->lock);
-            break;
-
-        default:
-            ret = -EINVAL;
-            break;
-    }
-
-    return ret;
-}
+static struct attribute *pa12200001_ps_attributes[] = {
+    &dev_attr_ps_enable.attr,
+    &dev_attr_ps.attr,
+    &dev_attr_reg.attr,
+    &dev_attr_pscalibration.attr,
+    &dev_attr_pthredcalibration.attr,
+    &dev_attr_dev_init.attr,
+    &dev_attr_xtalk_param.attr,
+    &dev_attr_pthrd_param.attr,
+    NULL
+};
+static const struct attribute_group pa12200001_ps_attr_group = {
+    .attrs = pa12200001_ps_attributes,
+};
 
 static int pa12200001_open(struct inode *inode, struct file *file)
 {
-    u8 prox_param[4]={0};
-    struct pa12200001_data *data = i2c_get_clientdata(this_data->client);
-    APS_LOG("pa122_open_start read flash");
-    sensparams_read_from_flash(SENSPARAMS_TYPE_PROX, prox_param, 4);
-    if(prox_param[0] == 1)
-    {
-         mutex_lock(&this_data->lock);
-    i2c_write_reg(this_data->client, REG_PS_OFFSET,prox_param[3]);
-       mutex_unlock(&this_data->lock);
-    data->crosstalk = prox_param[3];
-    }
-   else{
-          mutex_lock(&this_data->lock);
-    i2c_write_reg(this_data->client, REG_PS_OFFSET,data->pdata->pa12_ps_offset_default);
-          mutex_unlock(&this_data->lock);
-    data->crosstalk = data->pdata->pa12_ps_offset_default;
-    }
-    APS_LOG("pa122_open_read flash finish");
-
     return 0;
 }
 
@@ -1582,59 +1476,152 @@ static int pa12200001_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-static struct file_operations pa12200001_fops = {
-    .owner      = THIS_MODULE,
-    .open       = pa12200001_open,
-    .release    = pa12200001_release,
+static long pa12200001_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    int enable;
+    int alspsdata;
+    int mode;
+    int ret = -1;
+
+    if (pa12_i2c_client == NULL) {
+        pr_err("i2c driver not installed\n");
+        return -ENODEV;
+    }
+
+	pr_info("cmd = %u\n", _IOC_NR(cmd));
+    switch (cmd) {
+        case PA12_IOCTL_PS_ENABLE:
+            ret = copy_from_user(&enable,(void __user *)arg, sizeof(enable));
+            if (ret) {
+                pr_err("PS enable copy data failed\n");
+                return -EFAULT;
+            }
+
+            mode=pa12200001_get_mode(pa12_i2c_client);
+            mode=((mode & 0x01) | (enable << 1));  //clear bit 1 then set enable status
+            pa12200001_set_mode(pa12_i2c_client,mode);
+
+            break;
+
+        case PA12_IOCTL_PS_GET_DATA:
+            alspsdata=pa12200001_get_ps_value(pa12_i2c_client);
+            ret = copy_to_user((void __user *)arg,&alspsdata,sizeof(alspsdata));
+            if (ret) {
+                pr_err("PS Read data copy data failed\n");
+                return -EFAULT;
+            }
+            break;
+
+        case PA12_IOCTL_PS_CALIBRATION:
+            alspsdata=pa12200001_run_calibration(pa12_i2c_client);
+            ret = copy_to_user((void __user *)arg,&alspsdata,sizeof(alspsdata));
+            if (ret) {
+                pr_err("PS Calibration copy data failed\n");
+                return -EFAULT;
+            }
+            break;
+
+#ifdef USE_LIGHT_FEATURE
+        case PA12_IOCTL_ALS_ENABLE:
+            ret = copy_from_user(&enable,(void __user *)arg, sizeof(enable));
+            if (ret) {
+                pr_err("ALS enable copy data failed\n");
+                return -EFAULT;
+            }
+
+            mode=pa12200001_get_mode(pa12_i2c_client);
+            mode=((mode & 0x02) | enable);  //clear bit 0 then set enable status
+            pa12200001_set_mode(pa12_i2c_client,mode);
+            break;
+
+        case PA12_IOCTL_ALS_GET_DATA:
+            alspsdata=pa12200001_get_lux_value(pa12_i2c_client);
+            ret = copy_to_user(&alspsdata,(void __user *)arg, sizeof(alspsdata));
+            if (ret) {
+                pr_err("ALS Read copy data failed\n");
+                return -EFAULT;
+            }
+            break;
+#endif
+
+        default:
+            break;
+    }
+    return 0;
+}
+
+static const struct file_operations pa12200001_fops = {
+    .owner = THIS_MODULE,
+    .open = pa12200001_open,
+    .release = pa12200001_release,
     .unlocked_ioctl = pa12200001_ioctl,
 };
-
-static struct miscdevice pa12200001_dev = {
-    .minor  = MISC_DYNAMIC_MINOR,
-    .name   = ALSPROX_DEVICE_NAME,
-    .fops   = &pa12200001_fops,
+static struct miscdevice pa12200001_alsps_device = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = MISC_DEV_NAME,
+    .fops = &pa12200001_fops,
 };
 
-/*
- * I2C init/probing/exit functions
- */
+#ifdef CONFIG_HAS_EARLYSUSPEND
+/*Suspend/Resume*/
+static void pa12200001_early_suspend(struct early_suspend *h)
+{
+}
+static void pa12200001_late_resume(struct early_suspend *h)
+{
+}
+static struct early_suspend pa12_early_suspend_desc = {
+    .level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN,
+    .suspend = pa12200001_early_suspend,
+    .resume = pa12200001_late_resume,
+};
+#endif
 
-static int /*__devinit*/ pa12200001_probe(struct i2c_client *client,
+int pa12200001_ps_state(void)
+{
+	int mode = 0;
+	int pval = -1;
+	struct pa12200001_data *data;
+	u8 psdata;
+
+	if (pa12_i2c_client)
+		data = i2c_get_clientdata(pa12_i2c_client);
+	else
+		return -ENODEV;
+
+	if (data && !data->ps_enable) {
+		mode = pa12200001_get_mode(data->client);
+		/* turn on ps */
+		mode |= PS_ACTIVE;
+		pa12200001_set_mode(data->client, mode);
+		msleep(20);
+		psdata = pa12200001_get_ps_value(data->client);
+		if (psdata > data->ps_thrd_high)
+			pval = 1;
+		else if (psdata < data->ps_thrd_low)
+			pval = 0;
+		/* turn off ps */
+		mode &= ~PS_ACTIVE;
+		pa12200001_set_mode(data->client, mode);
+	}
+	pr_info("pval = %d\n", pval);
+	return pval;
+}
+EXPORT_SYMBOL(pa12200001_ps_state);
+
+static int pa12200001_probe(struct i2c_client *client,
         const struct i2c_device_id *id)
 {
-    struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
     struct pa12200001_data *data;
-    struct pa12200001_platform_data *pdata=NULL;
+    struct pa12200001_platform_data *pdata=client->dev.platform_data;
     int err = 0;
     int ret = 0;
-    //u8 prox_param[4]={0};
 
-    //Device Tree Modify
-    if (client->dev.of_node) {
-        pdata = devm_kzalloc(&client->dev, sizeof(struct pa12200001_platform_data), GFP_KERNEL);
-        if (NULL == pdata) {
-            dev_err(&client->dev, "Failed to allocate memory\n");
-            return -ENOMEM;
-        }
-        ret = pa12200001_parse_dt(&client->dev, pdata);
-        if (ret) {
-            dev_err(&client->dev, "Get pdata failed from Device Tree\n");
-            return ret;
-        }
-    } else {
-        pdata = client->dev.platform_data;
-        if (NULL == pdata) {
-            dev_err(&client->dev, "pdata is NULL\n");
-            return -ENOMEM;
-        }
+	pr_debug("enter, addr = 0x%x\n", client->addr);
+    if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_I2C_BLOCK)) {
+        pr_err("i2c check functionality error");
+		return -ENODEV;
     }
-    //Device Tree Modify
-
-    APS_DBG("probe start!\n" );
-
-
-    if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE))
-        return -EIO;
 
     data = kzalloc(sizeof(struct pa12200001_data), GFP_KERNEL);
     if (!data)
@@ -1642,195 +1629,236 @@ static int /*__devinit*/ pa12200001_probe(struct i2c_client *client,
 
     data->client = client;
     data->pdata  = pdata;
+    pa12_i2c_client = client;
     i2c_set_clientdata(client, data);
+
+    err = sensor_parse_dt(&client->dev, data);
+    if (err) {
+		kfree(data);
+		data = NULL;
+        pr_err("parse dt failed\n");
+        return err;
+    }
     mutex_init(&data->lock);
 
-    wake_lock_init(&data->prx_wake_lock, WAKE_LOCK_SUSPEND, "prx_wake_lock");
-
-    INIT_WORK(&data->work_proximity, pa12200001_work_func_proximity);
-    INIT_WORK(&data->work_light, pa12200001_work_func_light);
+    INIT_WORK(&data->work_proximity, pa12200001_work_func_proximity);	//PS  polling work regist
+#ifdef USE_LIGHT_FEATURE
+    INIT_WORK(&data->work_light, pa12200001_work_func_light);		//ALS  polling work regist
+#endif
+    INIT_WORK(&data->work_irq, pa12200001_work_func_irq);			//IRQ Work func
 
     pa12200001_timer_init(data);
 
-    /* initialize the AP321X chip */
-    err = pa12200001_init_client(client);
-    if (err)
-        goto exit_kfree;
-    this_data = data;
-
-    /* allocate input_device */
-    data->light_input_dev= input_allocate_device();
+#ifdef USE_LIGHT_FEATURE
+    data->light_input_dev = input_allocate_device();
     if (!data->light_input_dev) {
-        printk(KERN_ERR"%s: allocate light input device fail !\n", __func__);
-        ret = -1;
-        goto exit_kfree;
+        err = -ENOMEM;
+        pr_err("allocate light input dev failed\n");
     }
-    data->light_input_dev->name = PA12200001_INPUT_NAME_L;
-    data->light_input_dev->id.bustype = BUS_I2C;
-    set_bit(EV_MSC, data->light_input_dev->evbit);//longjiang modify for fastmmi 20131104
-    input_set_capability(data->light_input_dev, EV_MSC, MSC_SCAN);//longjiang modify for fastmmi 20131104
-    /* light Lux data */
-    ret = input_register_device(data->light_input_dev);
-    if (ret != 0) {
-        printk(KERN_ERR"%s: light_input_register_device failed ! \n", __func__);
-        goto exit_free_dev_als;
+    set_bit(EV_ABS, data->light_input_dev->evbit);
+    input_set_drvdata(data->light_input_dev, data);
+    data->light_input_dev->name = "light";
+
+    input_set_capability(data->light_input_dev, EV_ABS, ABS_LIGHT);
+    input_set_abs_params(data->light_input_dev, ABS_LIGHT, 0, 1, 0, 0);
+
+    ret = input_register_device(data->light_input_dev);			//ALS INPUT regist
+    if (ret < 0) {
+        err = -ENOMEM;
+        pr_err("register light input dev failed\n");
     }
-    data->proximity_input_dev= input_allocate_device();
+#endif
+    data->proximity_input_dev = input_allocate_device();
     if (!data->proximity_input_dev) {
-        printk(KERN_ERR"%s: allocate proximity input device fail !\n", __func__);
-        ret = -1;
-        goto exit_kfree;
+        err = -ENOMEM;
+        pr_err("alloc proximity input dev failed\n");
     }
-    data->proximity_input_dev->name = PA12200001_INPUT_NAME_P;
-    data->proximity_input_dev->id.bustype = BUS_I2C;
-    set_bit(EV_ABS, data->proximity_input_dev->evbit);//longjiang modify for fastmmi 20131104
-    input_set_capability(data->proximity_input_dev, EV_MSC, MSC_SCAN);
-    /* proximity data */
-    ret = input_register_device(data->proximity_input_dev);
-    if (ret != 0) {
-        printk(KERN_ERR"%s: proximity_input_register_device failed ! \n", __func__);
-        goto exit_free_dev_als;
-    }
+    set_bit(EV_ABS, data->proximity_input_dev->evbit);
+    input_set_drvdata(data->proximity_input_dev, data);
+    data->proximity_input_dev->name = "proximity";
+    //input_set_capability(data->proximity_input_dev, EV_ABS, ABS_DISTANCE);
+    input_set_abs_params(data->proximity_input_dev, ABS_DISTANCE, 0, 1, 0, 0);
 
-    //register misc//
-    ret = misc_register(&pa12200001_dev);
-    if (ret) {
-        printk(KERN_ERR "%s: PA12 ALS misc_register failed.\n", __func__);
-        goto failed_misc_register;
+    ret = input_register_device(data->proximity_input_dev);			//PS INPUT regist
+    if (ret < 0) {
+        err = -ENOMEM;
+        pr_err("register proximity input dev failed\n");
     }
+	pr_debug("register input device done\n");
 
-    ret = sysfs_create_group(&client->dev.kobj, &pa12200001_attr_group);//csl modify 20140107
-    if (ret) {
-        APS_LOG("could not create sysfs group\n");
-        goto exit_unregister_dev_ps;
-    }
-
-    data->wq = create_singlethread_workqueue("pa12200001_wq");
-    if (!data->wq) {
-        APS_LOG("could not create workqueue\n");
-        goto exit_work;
-    }
-
-    if (!als_polling || !ps_polling)//if lianzhezhongyouyigeweiyi
+#ifdef USE_LIGHT_FEATURE
+    if (!PS_POLLING || !ALS_POLLING)
+#else
+    if (!PS_POLLING)
+#endif
     {
+        if (gpio_is_valid(data->irq_gpio)) {
+            err = gpio_request(data->irq_gpio, "pa12200001_irq_gpio");
+            if (err) {
+                pr_err("request irq gpio request failed\n");
+                return -EINTR;
+            }
 
-        gpio_request(pdata->gpio_int, PA12200001_DRV_NAME);
-        gpio_direction_input(pdata->gpio_int);
+            err = gpio_direction_input(data->irq_gpio);
+            if (err) {
+                pr_err("set irq gpio dir failed\n");
+                return -EIO;
+            }
+        }
 
-        data->als_ps_int = gpio_to_irq(pdata->gpio_int);//shenqignzhognduanhao
+        data->irq = data->client->irq= gpio_to_irq(data->irq_gpio);
 
-        err = request_irq(data->als_ps_int,pa12200001_irq, (data->pdata->pa12_int_type == 1) ? (IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING) : IRQF_TRIGGER_FALLING,
-                          PA12200001_DRV_NAME,(void *)client);
-/*
-        err = request_threaded_irq(data->pdata->irq,pa12200001_irq, NULL,
-                (data->pdata->pa12_int_type == 1) ? (IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING) : IRQF_TRIGGER_FALLING,
-                PA12200001_DRV_NAME, (void *)client);
-*/
-        if (err != 0) {
-            APS_DBG("request irq fail!, irq = %d\n", data->als_ps_int);
-//          goto exit_remove_sysfs;
-        }else{
-        APS_DBG("request irq success, irq = %d\n", data->als_ps_int);
-        disable_irq_nosync(data->als_ps_int);
+        err = request_irq(data->irq,pa12200001_irq,
+                (PA12_INT_TYPE == 1) ? (IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING) : IRQF_TRIGGER_FALLING,
+                PA12200001_DRV_NAME,(void *)client);
+        if (err)
+            pr_err("request irq %d failed\n", data->irq);
+        else {
+			disable_irq(data->irq);
+			data->irq_enabled = 0;
+			pr_debug("register proximity irq done\n");
         }
     }
 
-    //Read X-talk Calibration value from flash
-#if 0
-    sensparams_read_from_flash(SENSPARAMS_TYPE_PROX, prox_param, 4);
-    if(prox_param[0] == 1)
-    {
-    i2c_write_reg(client, REG_PS_OFFSET,prox_param[3]);
-    data->crosstalk = prox_param[3];
+    data->wq = create_singlethread_workqueue("pa12200001_wq");
+    if (!data->wq)
+        pr_err("could not create workqueue\n");
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+    /*register suspend/resume*/
+    register_early_suspend(&pa12_early_suspend_desc);
+#endif
+
+    err = misc_register(&pa12200001_alsps_device);
+    if (err) {
+        pr_err("miscdev regist error\n");
     }
-   else{
-    i2c_write_reg(client, REG_PS_OFFSET,data->pdata->pa12_ps_offset_default);
-    data->crosstalk = data->pdata->pa12_ps_offset_default;
+
+    /*Device Initialize*/
+    err = pa12200001_init_client(client);
+	if (err < 0) {
+		pr_err("init device failed\n");
+		goto dev_init_err;
+	}
+
+#ifdef USE_LIGHT_FEATURE
+    ret = sysfs_create_group(&data->light_input_dev->dev.kobj,
+			&pa12200001_als_attr_group);
+    if (ret) {
+        pr_err("could not create als sysfs group\n");
     }
 #endif
-        #if 0
-#ifdef CONFIG_PM
-    data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN;
-    data->early_suspend.suspend = pa12200001_early_suspend;
-    data->early_suspend.resume = pa12200001_late_resume;
-    register_early_suspend(&data->early_suspend);
-#endif /* CONFIG_PM */
-    #endif
+    ret = sysfs_create_group(&data->proximity_input_dev->dev.kobj,
+			&pa12200001_ps_attr_group);
+    if (ret) {
+        pr_err("could not create ps sysfs group\n");
+    }
 
-    device_init_wakeup(&client->dev, 1);
-    dev_info(&client->dev, "Driver version %s enabled\n", DRIVER_VERSION);
-    APS_DBG("probe end!\n" );
+    /*Fast PS Calibration*/
+    //if(PA12_FAST_CAL)
+        //pa12200001_run_fast_calibration(client);
+
+    data->ps_cdev = sensors_proximity_cdev;
+	data->ps_cdev.sensors_enable = pa12200001_ps_set_enable;
+
+//	if (PS_POLLING)
+//	data->ps_cdev.sensors_poll_delay = pa12200001_ps_poll_delay;
+
+    err = sensors_classdev_register(&client->dev, &data->ps_cdev);
+	if (err)
+		pr_err("register sensors class failed %d\n", err);
+
+	input_report_abs(data->proximity_input_dev, ABS_DISTANCE, PA12_PS_FAR_DISTANCE);
+	input_sync(data->proximity_input_dev);
+	data->ps_stat = PA12_PS_FAR_DISTANCE;
+	pr_notice("probe success\n");
     return 0;
 
-//exit_remove_sysfs:
-//  destroy_workqueue(data->wq);
-
-failed_misc_register:
-    misc_deregister(&pa12200001_dev);
-
-exit_work:
-    sysfs_remove_group(&client->dev.kobj, &pa12200001_attr_group);//csl modify 20140107
-
-exit_unregister_dev_ps:
+dev_init_err:
+#ifdef USE_LIGHT_FEATURE
     input_unregister_device(data->light_input_dev);
+#endif
     input_unregister_device(data->proximity_input_dev);
-//exit_free_dev_ps:
-    //input_free_device(data->input_dev);
 
-exit_free_dev_als:
+#ifdef USE_LIGHT_FEATURE
     input_free_device(data->light_input_dev);
+#endif
     input_free_device(data->proximity_input_dev);
 
-exit_kfree:
-    wake_lock_destroy(&data->prx_wake_lock);
+	misc_deregister(&pa12200001_alsps_device);
+	wake_lock_init(&data->ps_wakelock, WAKE_LOCK_SUSPEND, "pa12200001-ps-wakelock");
+
+#ifdef USE_LIGHT_FEATURE
+    if (!PS_POLLING || !ALS_POLLING)
+#else
+    if (!PS_POLLING)
+#endif
+    {
+        free_irq(data->irq, client);
+        gpio_free(data->irq_gpio);
+    }
+
+    destroy_workqueue(data->wq);
     mutex_destroy(&data->lock);
+
     kfree(data);
-    return err;
+	data = NULL;
+	return -ENODEV;
 }
 
-static int /*__devexit*/ pa12200001_remove(struct i2c_client *client)
+static int pa12200001_remove(struct i2c_client *client)
 {
     struct pa12200001_data *data = i2c_get_clientdata(client);
 
-    if (pa12200001_get_mode(client)& PS_ACTIVE)
-    {
-        if (ps_polling)
-        hrtimer_cancel(&data->proximity_timer);
+    if (pa12200001_get_mode(client)& PS_ACTIVE) {
+        if (PS_POLLING)
+            hrtimer_cancel(&data->proximity_timer);
         cancel_work_sync(&data->work_proximity);
     }
-    if (pa12200001_get_mode(client) & ALS_ACTIVE)
-    {
-        if (als_polling)
-        hrtimer_cancel(&data->light_timer);
+
+#ifdef USE_LIGHT_FEATURE
+    if (pa12200001_get_mode(client) & ALS_ACTIVE) {
+        if (ALS_POLLING)
+		hrtimer_cancel(&data->light_timer);
         cancel_work_sync(&data->work_light);
     }
 
     input_unregister_device(data->light_input_dev);
+#endif
     input_unregister_device(data->proximity_input_dev);
 
+#ifdef USE_LIGHT_FEATURE
     input_free_device(data->light_input_dev);
+#endif
     input_free_device(data->proximity_input_dev);
-//    input_free_device(data->proximity_input_dev);
 
-    if (!als_polling || !ps_polling)
-        free_irq(data->als_ps_int, data);
+    misc_deregister(&pa12200001_alsps_device);
 
-    sysfs_remove_group(&client->dev.kobj, &pa12200001_attr_group);
+#ifdef USE_LIGHT_FEATURE
+    if (!PS_POLLING || !ALS_POLLING)
+#else
+    if (!PS_POLLING)
+#endif
+    {
+        free_irq(data->irq, client);
+        gpio_free(data->irq_gpio);
+    }
+
+#ifdef USE_LIGHT_FEATURE
+	sysfs_remove_group(&data->light_input_dev->dev.kobj, &pa12200001_als_attr_group);
+#endif
+	sysfs_remove_group(&data->proximity_input_dev->dev.kobj, &pa12200001_ps_attr_group);
 
     /* Power down the device */
     pa12200001_set_mode(client, 0);
 
     destroy_workqueue(data->wq);
     mutex_destroy(&data->lock);
-    wake_lock_destroy(&data->prx_wake_lock);
-//#ifdef CONFIG_PM
-//  unregister_early_suspend(&data->early_suspend);
-//#endif
-    kfree(data);
+	wake_lock_destroy(&data->ps_wakelock);
 
+    kfree(data);
     return 0;
 }
-
 
 static const struct i2c_device_id pa12200001_id[] = {
     { PA12200001_DRV_NAME, 0 },
@@ -1838,25 +1866,38 @@ static const struct i2c_device_id pa12200001_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, pa12200001_id);
 
-static struct of_device_id txc_match_table[] = {
-    { .compatible = "pa12200001",},
-    { },
+static struct of_device_id pa12200001_match_table[] = {
+    {.compatible = "pa12200001",},
+    {},
 };
 
+#if CONFIG_PM
+static int pa12200001_pm_suspend(struct device *dev)
+{
+    return 0;
+}
+static int pa12200001_pm_resume(struct device *dev)
+{
+    return 0;
+}
+static const struct dev_pm_ops pa12200001_dev_pm_ops = {
+	.suspend = pa12200001_pm_suspend,
+	.resume = pa12200001_pm_resume,
+};
+#endif
 static struct i2c_driver pa12200001_driver = {
     .driver = {
-        .name   = PA12200001_DRV_NAME,
-        .owner  = THIS_MODULE,
-        .of_match_table = txc_match_table,
+        .name	= PA12200001_DRV_NAME,
+        .owner	= THIS_MODULE,
+        .of_match_table = pa12200001_match_table,
+#if CONFIG_PM
+		.pm = &pa12200001_dev_pm_ops,
+#endif
     },
-    .probe  = pa12200001_probe,
-    .remove = pa12200001_remove ,/*__devexit_p(pa12200001_remove),*/
+    .probe	= pa12200001_probe,
+    .remove	= pa12200001_remove,
     .id_table = pa12200001_id,
-    .suspend   = pa12200001_suspend,    //Power Manager
-    .resume    = pa12200001_resume,     //Power Manager
 };
-
-
 
 static int __init pa12200001_init(void)
 {
@@ -1869,9 +1910,9 @@ static void __exit pa12200001_exit(void)
 }
 
 MODULE_AUTHOR("Sensor Team, TXC");
-MODULE_DESCRIPTION("PA12200001 ambient light + proximity sensor driver.");
+MODULE_DESCRIPTION("PA12 ambient light + proximity sensor driver.");
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION(DRIVER_VERSION);
 
-late_initcall(pa12200001_init);
+module_init(pa12200001_init);
 module_exit(pa12200001_exit);

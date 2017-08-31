@@ -1,6 +1,6 @@
 /*!
  * @section LICENSE
- * (C) Copyright 2011~2016 Bosch Sensortec GmbH All Rights Reserved
+ * (C) Copyright 2011~2015 Bosch Sensortec GmbH All Rights Reserved
  *
  * This software program is licensed subject to the GNU General
  * Public License (GPL).Version 2,June 1991,
@@ -8,8 +8,8 @@
  *
  * @filename bmi160_i2c.c
  * @date     2014/11/25 14:40
- * @id       "ba266c5"
- * @version  1.3
+ * @id       "b3ccb9e"
+ * @version  1.2
  *
  * @brief
  * This file implements moudle function, which add
@@ -252,7 +252,7 @@ static int bmi_i2c_probe(struct i2c_client *client,
 		int err = 0;
 		struct bmi_client_data *client_data = NULL;
 
-		dev_info(&client->dev, "BMI160 i2c function probe entrance");
+		dev_info(&client->dev, "BMI160 i2c function probe entrance (new)");
 
 		if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 			dev_err(&client->dev, "i2c_check_functionality error!");
@@ -277,7 +277,6 @@ static int bmi_i2c_probe(struct i2c_client *client,
 			goto exit_err_clean;
 		}
 
-		client_data->i2c = client;
 		client_data->device.bus_read = bmi_i2c_read_wrapper;
 		client_data->device.bus_write = bmi_i2c_write_wrapper;
 
